@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""Local-first installer for Agent Engineering Framework; Python stdlib only."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import shutil
+import sys
+import tempfile
+import re
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover
+    tomllib = None
+
+FRAMEWORK = Path(__file__).resolve().parents[1]
+VERSION = (FRAMEWORK / "VERSION").read_text(encoding="utf-8").strip()
+MAJOR = VERSION.split(".", 1)[0]
+MARKER_START = "<!-- agent-framework:start -->"
+MARKER_END = "<!-- agent-framework:end -->"
+MANAGED_REL = Path(".agent-managed/agent-engineering-framework")
+ASSET_DIRS = ("core", "agents", "harness", "profiles")
+
+
+def fail(message: str) -> None:
+    print(f"ERROR: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def load_toml(path: Path) -> dict:
+    if tomllib is None:
+        return load_flat_toml(path)
+    try:
+        with path.open("rb") as stream:
+            return tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        fail(f"invalid TOML {path}: {error}")
+
+
+def load_flat_toml(path: Path) -> dict:
+    """Parse framework's deliberately small TOML subset on Python <3.11."""
+    data: dict = {}
+    node = data
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        fail(f"cannot read TOML {path}: {error}")
+    for number, raw in enumerate(lines, 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        section = re.fullmatch(r"\[([A-Za-z0-9_.-]+)\]", line)
+        if section:
+            node = data
+            for part in section.group(1).split("."):
+                node = node.setdefault(part, {})
+            continue
+        match = re.fullmatch(r"([A-Za-z0-9_-]+)\s*=\s*(.+)", line)
+        if not match:
+            fail(f"invalid TOML {path}:{number}")
+        key, raw_value = match.groups()
+        if raw_value in {"true", "false"}:
+            value: object = raw_value == "true"
+        elif re.fullmatch(r'"(?:[^"\\]|\\.)*"', raw_value):
+            value = raw_value[1:-1]
+        elif raw_value.startswith("[") and raw_value.endswith("]"):
+            items = raw_value[1:-1].strip()
+            if not items:
+                value = []
+            else:
+                values = [part.strip() for part in items.split(",")]
+                if any(not re.fullmatch(r'"(?:[^"\\]|\\.)*"', item) for item in values):
+                    fail(f"unsupported TOML array {path}:{number}")
+                value = [item[1:-1] for item in values]
+        else:
+            fail(f"unsupported TOML value {path}:{number}")
+        node[key] = value
+    return data
+
+
+def profile_path(profile: str) -> Path:
+    path = FRAMEWORK / "profiles" / f"{profile}.md"
+    if not path.is_file():
+        fail(f"unknown profile: {profile}")
+    return path
+
+
+def manifest_path(root: Path) -> Path:
+    return root / ".agent-framework.toml"
+
+
+def parse_manifest(root: Path) -> dict:
+    path = manifest_path(root)
+    if not path.is_file():
+        fail("missing .agent-framework.toml; run agent-kit init --profile <name>")
+    data = load_toml(path)
+    if str(data.get("framework_version", "")) != MAJOR:
+        fail(f"framework major mismatch: project={data.get('framework_version')!r}, cli={MAJOR!r}")
+    profile = data.get("profile")
+    if not isinstance(profile, str):
+        fail("manifest profile must be a string")
+    profile_path(profile)
+    harnesses = data.get("harnesses")
+    if not isinstance(harnesses, list) or any(item not in {"codex", "opencode"} for item in harnesses):
+        fail("manifest harnesses must be a list containing only codex/opencode")
+    return data
+
+
+def write_manifest(root: Path, profile: str, harnesses: list[str]) -> None:
+    path = manifest_path(root)
+    if path.exists():
+        data = parse_manifest(root)
+        if data["profile"] != profile:
+            fail(f"existing profile is {data['profile']!r}; do not overwrite project manifest")
+        return
+    text = (FRAMEWORK / "templates/agent-framework.toml").read_text(encoding="utf-8")
+    text = text.replace('profile = "generic"', f'profile = "{profile}"')
+    text = text.replace('harnesses = ["codex", "opencode"]', "harnesses = [" + ", ".join(f'"{item}"' for item in harnesses) + "]")
+    path.write_text(text, encoding="utf-8")
+
+
+def managed_block() -> str:
+    return (FRAMEWORK / "templates/agents-managed-block.md").read_text(encoding="utf-8").strip()
+
+
+def sync_agents(root: Path, backup: bool) -> bool:
+    path = root / "AGENTS.md"
+    if path.exists():
+        original = path.read_text(encoding="utf-8")
+    else:
+        original = ""
+    starts, ends = original.count(MARKER_START), original.count(MARKER_END)
+    if starts != ends or starts > 1:
+        fail("AGENTS.md has malformed or duplicate agent-framework markers")
+    block = managed_block()
+    if starts == 1:
+        before, rest = original.split(MARKER_START, 1)
+        _, after = rest.split(MARKER_END, 1)
+        updated = before.rstrip() + "\n\n" + block + after
+    else:
+        if backup and path.exists():
+            backups = root / ".agent-managed/backups"
+            backups.mkdir(parents=True, exist_ok=True)
+            backup_path = backups / "AGENTS.md.before-agent-framework"
+            if not backup_path.exists():
+                backup_path.write_text(original, encoding="utf-8")
+        updated = (original.rstrip() + "\n\n" if original.strip() else "") + block + "\n"
+    if updated != original:
+        path.write_text(updated, encoding="utf-8")
+        return True
+    return False
+
+
+def copy_assets(root: Path, profile: str) -> None:
+    destination = root / MANAGED_REL
+    parent = destination.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=parent, prefix=".aef-sync-") as raw_temp:
+        temp = Path(raw_temp) / "agent-engineering-framework"
+        temp.mkdir()
+        for folder in ASSET_DIRS:
+            source = FRAMEWORK / folder
+            target = temp / folder
+            if folder == "profiles":
+                target.mkdir()
+                shutil.copy2(source / "generic.md", target / "generic.md")
+                shutil.copy2(source / f"{profile}.md", target / f"{profile}.md")
+            else:
+                shutil.copytree(source, target)
+        (temp / "VERSION").write_text(VERSION + "\n", encoding="utf-8")
+        digest = tree_digest(temp)
+        (temp / "metadata.toml").write_text(
+            f'framework_version = "{VERSION}"\nframework_major = "{MAJOR}"\ncontent_sha256 = "{digest}"\n',
+            encoding="utf-8",
+        )
+        previous = parent / ".agent-engineering-framework.previous"
+        if previous.exists():
+            shutil.rmtree(previous)
+        if destination.exists():
+            if not (destination / "metadata.toml").is_file():
+                fail(f"refusing to replace unmanaged directory: {destination}")
+            os.replace(destination, previous)
+        os.replace(temp, destination)
+        if previous.exists():
+            shutil.rmtree(previous)
+
+
+def tree_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and path.name != "metadata.toml":
+            digest.update(path.relative_to(root).as_posix().encode())
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def command_init(args: argparse.Namespace) -> None:
+    root = Path(args.root).resolve()
+    if not root.is_dir():
+        fail(f"not a repository directory: {root}")
+    profile_path(args.profile)
+    harnesses = args.harness or ["codex", "opencode"]
+    write_manifest(root, args.profile, harnesses)
+    copy_assets(root, args.profile)
+    changed = sync_agents(root, backup=True)
+    print(f"INIT: {root}")
+    print(f"PROFILE: {args.profile}")
+    print(f"AGENTS: {'updated' if changed else 'unchanged'}")
+
+
+def command_sync(args: argparse.Namespace) -> None:
+    root = Path(args.root).resolve()
+    data = parse_manifest(root)
+    copy_assets(root, data["profile"])
+    changed = sync_agents(root, backup=False)
+    print(f"SYNC: {root}")
+    print(f"AGENTS: {'updated' if changed else 'unchanged'}")
+
+
+def command_doctor(args: argparse.Namespace) -> None:
+    root = Path(args.root).resolve()
+    errors: list[str] = []
+    warnings: list[str] = []
+    try:
+        data = parse_manifest(root)
+    except SystemExit:
+        raise
+    profile = data["profile"]
+    managed = root / MANAGED_REL
+    if not managed.is_dir() or not (managed / "metadata.toml").is_file():
+        errors.append("managed assets missing")
+    else:
+        expected = tree_digest(managed)
+        meta = load_toml(managed / "metadata.toml")
+        if meta.get("content_sha256") != expected:
+            errors.append("managed assets stale or modified; run agent-kit sync")
+        if not (managed / "profiles" / f"{profile}.md").is_file():
+            errors.append(f"managed profile missing: {profile}")
+    agents = root / "AGENTS.md"
+    text = agents.read_text(encoding="utf-8") if agents.is_file() else ""
+    if text.count(MARKER_START) != 1 or text.count(MARKER_END) != 1:
+        errors.append("AGENTS.md managed block missing or malformed")
+    memory = root / ".ai-memory.toml"
+    if not memory.is_file():
+        warnings.append(".ai-memory.toml missing; ai-memory unavailable")
+    else:
+        memory_text = memory.read_text(encoding="utf-8")
+        if "drop_subagent_captures" not in memory_text:
+            warnings.append("ai-memory does not declare drop_subagent_captures")
+    for harness in data["harnesses"]:
+        adapter = managed / "harness" / f"{harness}.md"
+        print(f"HARNESS {harness}: {'adapter-ready' if adapter.is_file() else 'missing-adapter'}")
+        if shutil.which(harness) is None:
+            warnings.append(f"{harness} executable not found in PATH")
+    for warning in warnings:
+        print(f"WARN: {warning}")
+    for error in errors:
+        print(f"ERROR: {error}")
+    if errors:
+        raise SystemExit(1)
+    print(f"DOCTOR: PASS profile={profile} framework={VERSION}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="agent-kit")
+    parser.add_argument("--root", default=".", help="consumer repository")
+    sub = parser.add_subparsers(dest="command", required=True)
+    init = sub.add_parser("init")
+    init.add_argument("--profile", required=True)
+    init.add_argument("--harness", action="append", choices=("codex", "opencode"))
+    init.set_defaults(func=command_init)
+    sync = sub.add_parser("sync")
+    sync.set_defaults(func=command_sync)
+    doctor = sub.add_parser("doctor")
+    doctor.set_defaults(func=command_doctor)
+    version = sub.add_parser("version")
+    version.set_defaults(func=lambda _: print(VERSION))
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

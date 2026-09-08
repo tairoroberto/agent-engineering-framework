@@ -1,0 +1,13 @@
+framework_version = "1"
+profile = "generic"
+harnesses = ["codex", "opencode"]
+orchestration = true
+caverman = true
+ai_memory = true
+
+[project]
+rules = "AGENTS.md"
+
+[verification]
+tests = true
+analyze = true

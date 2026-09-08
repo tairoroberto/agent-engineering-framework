@@ -22,7 +22,7 @@ MAJOR = VERSION.split(".", 1)[0]
 MARKER_START = "<!-- agent-framework:start -->"
 MARKER_END = "<!-- agent-framework:end -->"
 MANAGED_REL = Path(".agent-managed/agent-engineering-framework")
-ASSET_DIRS = ("core", "agents", "harness", "profiles")
+ASSET_DIRS = ("core", "agents", "harness", "profiles", "skills")
 
 
 def fail(message: str) -> None:
@@ -197,6 +197,17 @@ def tree_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
+def expected_digest(profile: str) -> str:
+    with tempfile.TemporaryDirectory(prefix="aef-digest-") as raw:
+        temporary_root = Path(raw)
+        copy_assets(temporary_root, profile)
+        return tree_digest(temporary_root / MANAGED_REL)
+
+
+def config_path() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "agent-kit" / "framework.toml"
+
+
 def command_init(args: argparse.Namespace) -> None:
     root = Path(args.root).resolve()
     if not root.is_dir():
@@ -239,6 +250,8 @@ def command_doctor(args: argparse.Namespace) -> None:
             errors.append("managed assets stale or modified; run agent-kit sync")
         if not (managed / "profiles" / f"{profile}.md").is_file():
             errors.append(f"managed profile missing: {profile}")
+        if not (managed / "skills" / "engineering-protocol" / "SKILL.md").is_file():
+            errors.append("shared engineering-protocol missing")
     agents = root / "AGENTS.md"
     text = agents.read_text(encoding="utf-8") if agents.is_file() else ""
     if text.count(MARKER_START) != 1 or text.count(MARKER_END) != 1:
@@ -264,6 +277,35 @@ def command_doctor(args: argparse.Namespace) -> None:
     print(f"DOCTOR: PASS profile={profile} framework={VERSION}")
 
 
+def command_install(_: argparse.Namespace) -> None:
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f'framework_home = "{FRAMEWORK}"\nframework_version = "{VERSION}"\n', encoding="utf-8")
+    print(f"INSTALL: {path}")
+    print("DISCOVERY: consumers use managed skills via AGENTS.md; no consumer absolute path")
+
+
+def command_status(args: argparse.Namespace) -> None:
+    root = Path(args.root).resolve()
+    data = parse_manifest(root)
+    registry = config_path()
+    print(f"FRAMEWORK: {VERSION}")
+    print(f"PROFILE: {data['profile']}")
+    print("PROTOCOL: engineering-protocol")
+    print(f"REGISTRY: {'present' if registry.is_file() else 'missing'}")
+
+
+def command_diff(args: argparse.Namespace) -> None:
+    root = Path(args.root).resolve()
+    data = parse_manifest(root)
+    managed = root / MANAGED_REL
+    current = tree_digest(managed) if managed.is_dir() else None
+    expected = expected_digest(data["profile"])
+    print(f"MANAGED_ASSETS: {'change' if current != expected else 'unchanged'}")
+    agents = (root / "AGENTS.md").read_text(encoding="utf-8") if (root / "AGENTS.md").is_file() else ""
+    print(f"AGENTS_BLOCK: {'present' if agents.count(MARKER_START) == agents.count(MARKER_END) == 1 else 'change'}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="agent-kit")
     parser.add_argument("--root", default=".", help="consumer repository")
@@ -276,6 +318,12 @@ def main() -> None:
     sync.set_defaults(func=command_sync)
     doctor = sub.add_parser("doctor")
     doctor.set_defaults(func=command_doctor)
+    install = sub.add_parser("install")
+    install.set_defaults(func=command_install)
+    status = sub.add_parser("status")
+    status.set_defaults(func=command_status)
+    diff = sub.add_parser("diff")
+    diff.set_defaults(func=command_diff)
     version = sub.add_parser("version")
     version.set_defaults(func=lambda _: print(VERSION))
     args = parser.parse_args()

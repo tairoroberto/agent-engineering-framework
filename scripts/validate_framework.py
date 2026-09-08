@@ -11,6 +11,7 @@ REQUIRED = {
     "harness": ["codex.md", "opencode.md"],
     "profiles": ["generic.md", "flutter.md", "laravel.md"],
     "templates": ["agent-framework.toml", "agents-managed-block.md"],
+    "skills/engineering-protocol": ["SKILL.md", "references/routing-policy.json"],
 }
 
 
@@ -29,9 +30,14 @@ def main() -> int:
         errors.append("managed block markers invalid")
     if "<!-- ai-memory:" in text:
         errors.append("managed block must not contain ai-memory markers")
-    for path in (ROOT / "core").glob("*.md"):
+    generic_paths = [*(ROOT / "core").glob("*.md"), *(ROOT / "skills" / "engineering-protocol").rglob("*")]
+    for path in generic_paths:
+        if not path.is_file():
+            continue
         if "/Users/" in path.read_text(encoding="utf-8"):
-            errors.append(f"absolute user path in core: {path.name}")
+            errors.append(f"absolute user path in generic policy: {path.name}")
+        if path.suffix in {".md", ".json"} and any(token in path.read_text(encoding="utf-8").lower() for token in ("farm management system", "rfid", "weighing")):
+            errors.append(f"Farm coupling in generic policy: {path.relative_to(ROOT)}")
     if errors:
         print("validate_framework: FAIL")
         print("\n".join(errors))

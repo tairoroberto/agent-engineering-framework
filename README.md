@@ -12,11 +12,14 @@ Framework owns how agents cooperate. A project owns architecture, commands, rele
 
 ```bash
 /path/to/agent-engineering-framework/bin/agent-kit init --profile flutter
+/path/to/agent-engineering-framework/bin/agent-kit install
 /path/to/agent-engineering-framework/bin/agent-kit doctor
 /path/to/agent-engineering-framework/bin/agent-kit sync
 ```
 
 `init` creates `.agent-framework.toml`, copies lazy-load assets to `.agent-managed/agent-engineering-framework/`, backs up AGENTS.md once, and adds only its marker block. It never changes `.ai-memory.toml`. `sync` replaces only that managed directory.
+
+`install` registers the framework home in user configuration, never in a consumer repository. `status` reports selected profile/protocol/registry. `diff` is read-only and reports whether managed assets or routing block would change. Managed project-local assets are intentional: current Codex/OpenCode discovery differs, while one agent-kit-generated copy gives both harnesses the same protocol without hard-coded consumer paths or manual copies.
 
 ## Ownership
 
@@ -25,6 +28,8 @@ Framework: `.agent-managed/agent-engineering-framework/**` and content between `
 ## Harnesses, profiles, memory
 
 Codex and OpenCode load same managed core; adapters define discovery/capability only. `generic` is always installed; `flutter` and `laravel` contain reusable discovery/validation guidance only. Use ai-memory through targeted retrieval; current source and project rules win contradictions.
+
+`skills/engineering-protocol` is the single shared protocol activation point. It composes canonical `core/` policy rather than duplicating it. Technology profiles and project extensions supply only their own layer.
 
 ## Daily operation
 

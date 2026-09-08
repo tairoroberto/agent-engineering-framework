@@ -6,4 +6,7 @@ Read `.agent-framework.toml`, then only task-relevant documents under
 define cross-project agent behavior. Project rules in this AGENTS.md outside
 this block remain authoritative for this repository. Read `.ai-memory.toml`
 before using ai-memory; memory is historical context, not engineering authority.
+
+Use `skills/engineering-protocol/SKILL.md` for orchestration, delegation,
+Caverman, review, verification, handoff, and ai-memory behavior.
 <!-- agent-framework:end -->

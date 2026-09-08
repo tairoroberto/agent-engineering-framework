@@ -9,8 +9,9 @@ REQUIRED = {
     "core": ["principles.md", "orchestration.md", "delegation.md", "handoff.md", "verification.md", "memory.md", "caverman.md", "security.md"],
     "agents": ["orchestrator.md", "explorer.md", "implementer.md", "reviewer.md", "verifier.md"],
     "harness": ["codex.md", "opencode.md"],
-    "profiles": ["generic.md", "flutter.md", "laravel.md"],
+    "profiles": ["generic.md", "flutter.md", "laravel.md", "kotlin-multiplatform.md"],
     "templates": ["agent-framework.toml", "agents-managed-block.md"],
+    "workflows": ["manifest.toml", "continue.md", "feature.md", "review.md"],
     "skills/engineering-protocol": ["SKILL.md", "references/routing-policy.json"],
 }
 
@@ -30,6 +31,12 @@ def main() -> int:
         errors.append("managed block markers invalid")
     if "<!-- ai-memory:" in text:
         errors.append("managed block must not contain ai-memory markers")
+    workflows = ROOT / "workflows" / "manifest.toml"
+    if workflows.is_file():
+        workflow_text = workflows.read_text(encoding="utf-8")
+        for name in ("continue", "feature", "review"):
+            if f'name = "{name}"' not in workflow_text:
+                errors.append(f"workflow manifest missing {name}")
     generic_paths = [*(ROOT / "core").glob("*.md"), *(ROOT / "skills" / "engineering-protocol").rglob("*")]
     for path in generic_paths:
         if not path.is_file():

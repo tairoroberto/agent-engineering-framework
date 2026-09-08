@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import shutil
 import sys
@@ -22,7 +23,14 @@ MAJOR = VERSION.split(".", 1)[0]
 MARKER_START = "<!-- agent-framework:start -->"
 MARKER_END = "<!-- agent-framework:end -->"
 MANAGED_REL = Path(".agent-managed/agent-engineering-framework")
-ASSET_DIRS = ("core", "agents", "harness", "profiles", "skills")
+ASSET_DIRS = ("core", "agents", "harness", "profiles", "skills", "workflows")
+COMMAND_MARKER_START = "<!-- agent-framework-command:start"
+COMMAND_MARKER_END = "<!-- agent-framework-command:end -->"
+WORKFLOWS = {
+    "continue": "Resume engineering work from current evidence.",
+    "feature": "Plan and implement a feature with proportionate engineering rigor.",
+    "review": "Independently assess a change; review is distinct from verification.",
+}
 
 
 def fail(message: str) -> None:
@@ -154,6 +162,103 @@ def sync_agents(root: Path, backup: bool) -> bool:
     return False
 
 
+def project_workflow_hook(data: dict, workflow: str) -> str | None:
+    workflows = data.get("workflows", {})
+    if not isinstance(workflows, dict):
+        return None
+    settings = workflows.get(workflow, {})
+    if not isinstance(settings, dict):
+        return None
+    hook = settings.get("after")
+    if hook is not None and not isinstance(hook, str):
+        fail(f"workflows.{workflow}.after must be a string")
+    return hook
+
+
+def managed_command(workflow: str, description: str, hook: str | None = None) -> str:
+    lines = [
+        "---",
+        f"description: {json.dumps(description)}",
+        "agent: orchestrator",
+        "---",
+        "",
+        f"<!-- agent-framework-command:start workflow={workflow} -->",
+        f"Load `.agent-managed/agent-engineering-framework/workflows/{workflow}.md`.",
+        "Load only the relevant engineering-protocol, profile, and project rules it routes to.",
+        "This is a generated adapter; do not redefine workflow semantics here.",
+        "Intent or feature reference: `$ARGUMENTS`.",
+    ]
+    if hook:
+        lines.append(f"Project-owned post-workflow hook: `{hook}`.")
+    lines.extend((COMMAND_MARKER_END, ""))
+    return "\n".join(lines)
+
+
+def managed_codex_prompt(workflow: str, description: str) -> str:
+    return "\n".join((
+        "---",
+        f"description: {json.dumps(description)}",
+        "argument-hint: <intent-or-feature-id>",
+        "---",
+        "",
+        f"<!-- agent-framework-command:start workflow={workflow} -->",
+        f"In the current repository, load `.agent-managed/agent-engineering-framework/workflows/{workflow}.md`.",
+        "Load only the relevant engineering-protocol, profile, and project rules it routes to.",
+        "This is a generated adapter; do not redefine workflow semantics here.",
+        "Intent or feature reference: `$ARGUMENTS`.",
+        COMMAND_MARKER_END,
+        "",
+    ))
+
+
+def backup_once(root: Path, source: Path, name: str) -> None:
+    backup = root / ".agent-managed" / "backups" / name
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    if not backup.exists() and source.exists():
+        backup.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def sync_opencode_commands(root: Path, data: dict, backup: bool) -> list[str]:
+    enabled = "opencode" in data["harnesses"]
+    if not enabled:
+        return []
+    changed: list[str] = []
+    commands = root / ".opencode" / "commands"
+    for workflow, description in WORKFLOWS.items():
+        target = commands / f"{workflow}.md"
+        expected = managed_command(workflow, description, project_workflow_hook(data, workflow))
+        current = target.read_text(encoding="utf-8") if target.exists() else ""
+        owned = COMMAND_MARKER_START in current and COMMAND_MARKER_END in current
+        if target.exists() and not owned:
+            if not backup:
+                fail(f"refusing to replace unmanaged OpenCode command: {target}")
+            backup_once(root, target, f"opencode-{workflow}.md.before-agent-framework")
+        if current != expected:
+            commands.mkdir(parents=True, exist_ok=True)
+            target.write_text(expected, encoding="utf-8")
+            changed.append(workflow)
+    return changed
+
+
+def sync_codex_prompts() -> list[str]:
+    """Codex custom prompts are global by harness design, not project files."""
+    prompts = Path.home() / ".codex" / "prompts"
+    changed: list[str] = []
+    for workflow, description in WORKFLOWS.items():
+        target = prompts / f"{workflow}.md"
+        expected = managed_codex_prompt(workflow, description)
+        current = target.read_text(encoding="utf-8") if target.exists() else ""
+        owned = COMMAND_MARKER_START in current and COMMAND_MARKER_END in current
+        if target.exists() and not owned:
+            print(f"WARN: leaving unmanaged Codex prompt: {target}")
+            continue
+        if current != expected:
+            prompts.mkdir(parents=True, exist_ok=True)
+            target.write_text(expected, encoding="utf-8")
+            changed.append(workflow)
+    return changed
+
+
 def copy_assets(root: Path, profile: str) -> None:
     destination = root / MANAGED_REL
     parent = destination.parent
@@ -215,11 +320,14 @@ def command_init(args: argparse.Namespace) -> None:
     profile_path(args.profile)
     harnesses = args.harness or ["codex", "opencode"]
     write_manifest(root, args.profile, harnesses)
+    data = parse_manifest(root)
     copy_assets(root, args.profile)
     changed = sync_agents(root, backup=True)
+    commands = sync_opencode_commands(root, data, backup=True)
     print(f"INIT: {root}")
     print(f"PROFILE: {args.profile}")
     print(f"AGENTS: {'updated' if changed else 'unchanged'}")
+    print(f"OPENCODE_COMMANDS: {','.join(commands) if commands else 'unchanged'}")
 
 
 def command_sync(args: argparse.Namespace) -> None:
@@ -227,8 +335,10 @@ def command_sync(args: argparse.Namespace) -> None:
     data = parse_manifest(root)
     copy_assets(root, data["profile"])
     changed = sync_agents(root, backup=False)
+    commands = sync_opencode_commands(root, data, backup=False)
     print(f"SYNC: {root}")
     print(f"AGENTS: {'updated' if changed else 'unchanged'}")
+    print(f"OPENCODE_COMMANDS: {','.join(commands) if commands else 'unchanged'}")
 
 
 def command_doctor(args: argparse.Namespace) -> None:
@@ -252,6 +362,11 @@ def command_doctor(args: argparse.Namespace) -> None:
             errors.append(f"managed profile missing: {profile}")
         if not (managed / "skills" / "engineering-protocol" / "SKILL.md").is_file():
             errors.append("shared engineering-protocol missing")
+        for workflow in WORKFLOWS:
+            available = (managed / "workflows" / f"{workflow}.md").is_file()
+            print(f"WORKFLOW {workflow}: {'ready' if available else 'missing'}")
+            if not available:
+                errors.append(f"shared workflow missing: {workflow}")
     agents = root / "AGENTS.md"
     text = agents.read_text(encoding="utf-8") if agents.is_file() else ""
     if text.count(MARKER_START) != 1 or text.count(MARKER_END) != 1:
@@ -268,6 +383,22 @@ def command_doctor(args: argparse.Namespace) -> None:
         print(f"HARNESS {harness}: {'adapter-ready' if adapter.is_file() else 'missing-adapter'}")
         if shutil.which(harness) is None:
             warnings.append(f"{harness} executable not found in PATH")
+        if harness == "opencode":
+            for workflow in WORKFLOWS:
+                command = root / ".opencode" / "commands" / f"{workflow}.md"
+                command_text = command.read_text(encoding="utf-8") if command.is_file() else ""
+                ready = COMMAND_MARKER_START in command_text and COMMAND_MARKER_END in command_text
+                print(f"OPENCODE_COMMAND /{workflow}: {'ready' if ready else 'missing'}")
+                if not ready:
+                    errors.append(f"OpenCode command missing or unmanaged: /{workflow}")
+        if harness == "codex":
+            for workflow in WORKFLOWS:
+                prompt = Path.home() / ".codex" / "prompts" / f"{workflow}.md"
+                prompt_text = prompt.read_text(encoding="utf-8") if prompt.is_file() else ""
+                ready = COMMAND_MARKER_START in prompt_text and COMMAND_MARKER_END in prompt_text
+                print(f"CODEX_PROMPT /prompts:{workflow}: {'ready' if ready else 'missing'}")
+                if not ready:
+                    warnings.append(f"Codex prompt unavailable: /prompts:{workflow}; run agent-kit install")
     for warning in warnings:
         print(f"WARN: {warning}")
     for error in errors:
@@ -281,8 +412,10 @@ def command_install(_: argparse.Namespace) -> None:
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f'framework_home = "{FRAMEWORK}"\nframework_version = "{VERSION}"\n', encoding="utf-8")
+    prompts = sync_codex_prompts()
     print(f"INSTALL: {path}")
     print("DISCOVERY: consumers use managed skills via AGENTS.md; no consumer absolute path")
+    print(f"CODEX_PROMPTS: {','.join(prompts) if prompts else 'unchanged'}")
 
 
 def command_status(args: argparse.Namespace) -> None:
@@ -292,6 +425,7 @@ def command_status(args: argparse.Namespace) -> None:
     print(f"FRAMEWORK: {VERSION}")
     print(f"PROFILE: {data['profile']}")
     print("PROTOCOL: engineering-protocol")
+    print("WORKFLOWS: " + ", ".join(WORKFLOWS))
     print(f"REGISTRY: {'present' if registry.is_file() else 'missing'}")
 
 
@@ -304,6 +438,12 @@ def command_diff(args: argparse.Namespace) -> None:
     print(f"MANAGED_ASSETS: {'change' if current != expected else 'unchanged'}")
     agents = (root / "AGENTS.md").read_text(encoding="utf-8") if (root / "AGENTS.md").is_file() else ""
     print(f"AGENTS_BLOCK: {'present' if agents.count(MARKER_START) == agents.count(MARKER_END) == 1 else 'change'}")
+    if "opencode" in data["harnesses"]:
+        for workflow in WORKFLOWS:
+            target = root / ".opencode" / "commands" / f"{workflow}.md"
+            current = target.read_text(encoding="utf-8") if target.is_file() else ""
+            expected = managed_command(workflow, WORKFLOWS[workflow], project_workflow_hook(data, workflow))
+            print(f"OPENCODE_COMMAND /{workflow}: {'unchanged' if current == expected else 'change'}")
 
 
 def main() -> None:

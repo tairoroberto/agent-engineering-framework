@@ -31,11 +31,30 @@ class AgentKitTest(unittest.TestCase):
             self.assertEqual(agents_after_init.count("<!-- agent-framework:start -->"), 1)
             managed = root / ".agent-managed/agent-engineering-framework"
             self.assertTrue((managed / "skills/engineering-protocol/SKILL.md").is_file())
+            for workflow in ("continue", "feature", "review"):
+                self.assertTrue((managed / "workflows" / f"{workflow}.md").is_file())
+                command = root / ".opencode" / "commands" / f"{workflow}.md"
+                self.assertIn("agent-framework-command:start", command.read_text(encoding="utf-8"))
             metadata = (managed / "metadata.toml").read_bytes()
             self.run_cli(root, "sync")
             self.run_cli(root, "sync")
             self.assertEqual((root / "AGENTS.md").read_text(encoding="utf-8"), agents_after_init)
             self.assertEqual((managed / "metadata.toml").read_bytes(), metadata)
+
+    def test_init_backs_up_existing_opencode_workflow_and_sync_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "consumer"
+            (root / ".opencode" / "commands").mkdir(parents=True)
+            old = root / ".opencode" / "commands" / "feature.md"
+            old.write_text("project-owned old command\n", encoding="utf-8")
+            (root / ".ai-memory.toml").write_text('drop_subagent_captures = "true"\n', encoding="utf-8")
+            self.run_cli(root, "init", "--profile", "generic")
+            backup = root / ".agent-managed" / "backups" / "opencode-feature.md.before-agent-framework"
+            self.assertEqual(backup.read_text(encoding="utf-8"), "project-owned old command\n")
+            generated = old.read_bytes()
+            self.run_cli(root, "sync")
+            self.run_cli(root, "sync")
+            self.assertEqual(old.read_bytes(), generated)
 
     def run_cli(self, root: Path, *args: str) -> None:
         subprocess.run([str(CLI), "--root", str(root), *args], check=True, text=True, capture_output=True)

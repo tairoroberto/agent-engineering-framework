@@ -8,5 +8,7 @@ this block remain authoritative for this repository. Read `.ai-memory.toml`
 before using ai-memory; memory is historical context, not engineering authority.
 
 Use `skills/engineering-protocol/SKILL.md` for orchestration, delegation,
-Caverman, review, verification, handoff, and ai-memory behavior.
+Caveman, review, verification, handoff, and ai-memory behavior.
+For portable continuation, use the configured state provider; the framework
+default is `state/state.py` with project data at `.specs/features/<id>/state.json`.
 <!-- agent-framework:end -->

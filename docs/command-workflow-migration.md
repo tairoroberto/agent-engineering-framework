@@ -13,7 +13,7 @@ Farm Codex supplied agent profiles and routing, not project slash-command defini
 
 ## Ownership and drift correction
 
-Canonical workflow sequencing, selective delegation, Caverman, memory use, review, verification, and handoff live once in `workflows/` plus `engineering-protocol`/`core`. OpenCode adapters contain only metadata, workflow routing, arguments, and an optional declared project hook. Codex prompts contain the same route, using Codex's global prompt discovery. Farm-specific state closure is an explicit `[workflows.review]` manifest hook, not duplicated review policy.
+Canonical workflow sequencing, selective delegation, Caveman, memory use, review, verification, and handoff live once in `workflows/` plus `engineering-protocol`/`core`. OpenCode adapters contain only metadata, workflow routing, arguments, and an optional declared project hook. Codex prompts contain the same route, using Codex's global prompt discovery. Farm-specific state closure is an explicit `[workflows.review]` manifest hook, not duplicated review policy.
 
 The prior OpenCode commands drifted: `/continue` performed detailed reconciliation while `/feature` and `/review` restated different fragments of policy; Codex had no equivalent project command surface. The canonical workflows normalize those shared semantics while retaining Farm's state/gate implementation locally.
 
@@ -36,3 +36,9 @@ The prior OpenCode commands drifted: `/continue` performed detailed reconciliati
 ## Validation contract
 
 Run `agent-kit install` once per machine for Codex prompts. For every consumer run `agent-kit doctor`, then `agent-kit sync` twice; the second sync must report all generated adapters unchanged. The Farm protocol regression suite additionally checks that each OpenCode command routes to its managed workflow and that Farm `/review` retains its state-close hook.
+
+## Harness adapter rollout
+
+`agent-kit sync` now generates the discoverable harness surface needed before any workflow can run: OpenCode config, role profiles, gates adapter, commands, Codex config, and role profiles. The generic templates preserve Farm's role topology and safe defaults while deferring exact test/build commands to technology profiles and project rules.
+
+Farm retains its audited adapter tree through `[harness] managed_adapters = false`: its agents include PostgreSQL/Docker allowlists and its Orchestrator owns Farm state closure. That is a project override, not a second shared workflow. Flutter consumers use the framework-managed generic adapters directly.

@@ -41,7 +41,7 @@ Inventory source: Farm `.agents/skills/fms-engineering-protocol`, Farm Codex/Ope
 | Selective delegation/parallel safety | yes | core invariant |
 | Orchestrator/Explorer/Implementer | partial | generic roles |
 | Reviewer/Verifier separation | partial | generic roles |
-| Caverman/handoff | yes | core canonical |
+| Caveman/handoff | yes | core canonical |
 | Cross-harness | yes | managed skill + adapters |
 | Model routing | yes | capability classes/local mappings |
 | ai-memory | partial | targeted history protocol |

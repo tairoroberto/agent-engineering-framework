@@ -6,11 +6,13 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED = {
-    "core": ["principles.md", "orchestration.md", "delegation.md", "handoff.md", "verification.md", "memory.md", "caverman.md", "security.md"],
+    "core": ["principles.md", "orchestration.md", "delegation.md", "handoff.md", "verification.md", "memory.md", "caveman.md", "security.md"],
     "agents": ["orchestrator.md", "explorer.md", "implementer.md", "reviewer.md", "verifier.md"],
-    "harness": ["codex.md", "opencode.md"],
+    "harness": ["codex.md", "opencode.md", "copilot.md", "claude.md"],
     "profiles": ["generic.md", "flutter.md", "laravel.md", "kotlin-multiplatform.md"],
-    "templates": ["agent-framework.toml", "agents-managed-block.md"],
+    "templates": ["agent-framework.toml", "agents-managed-block.md", "ai-memory.toml"],
+    "docs": ["model-routing-and-installation.md", "guia-de-uso.md"],
+    "state": ["README.md", "schema.json", "state.py", "routing.py", "catalog.py", "activity.py", "validate_state.py"],
     "workflows": ["manifest.toml", "continue.md", "feature.md", "review.md"],
     "skills/engineering-protocol": ["SKILL.md", "references/routing-policy.json"],
 }
@@ -37,7 +39,7 @@ def main() -> int:
         for name in ("continue", "feature", "review"):
             if f'name = "{name}"' not in workflow_text:
                 errors.append(f"workflow manifest missing {name}")
-    generic_paths = [*(ROOT / "core").glob("*.md"), *(ROOT / "skills" / "engineering-protocol").rglob("*")]
+    generic_paths = [*(ROOT / "core").glob("*.md"), *(ROOT / "skills" / "engineering-protocol").rglob("*"), *(ROOT / "state").rglob("*")]
     for path in generic_paths:
         if not path.is_file():
             continue

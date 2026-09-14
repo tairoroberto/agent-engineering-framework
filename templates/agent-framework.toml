@@ -2,8 +2,13 @@ framework_version = "1"
 profile = "generic"
 harnesses = ["codex", "opencode"]
 orchestration = true
-caverman = true
+caveman = true
 ai_memory = true
+
+[state]
+# Portable evidence state. Data stays project-local; adapters never own it.
+provider = "framework"
+path = ".specs/features"
 
 [project]
 rules = "AGENTS.md"

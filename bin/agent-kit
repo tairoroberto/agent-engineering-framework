@@ -6,10 +6,13 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
@@ -18,12 +21,18 @@ except ModuleNotFoundError:  # pragma: no cover
     tomllib = None
 
 FRAMEWORK = Path(__file__).resolve().parents[1]
+STATE_DIR = FRAMEWORK / "state"
+if str(STATE_DIR) not in sys.path:
+    sys.path.insert(0, str(STATE_DIR))
+import catalog as model_catalog  # noqa: E402
+import activity as activity_runtime  # noqa: E402
+
 VERSION = (FRAMEWORK / "VERSION").read_text(encoding="utf-8").strip()
 MAJOR = VERSION.split(".", 1)[0]
 MARKER_START = "<!-- agent-framework:start -->"
 MARKER_END = "<!-- agent-framework:end -->"
 MANAGED_REL = Path(".agent-managed/agent-engineering-framework")
-ASSET_DIRS = ("core", "agents", "harness", "profiles", "skills", "workflows")
+ASSET_DIRS = ("core", "agents", "harness", "profiles", "skills", "state", "workflows")
 COMMAND_MARKER_START = "<!-- agent-framework-command:start"
 COMMAND_MARKER_END = "<!-- agent-framework-command:end -->"
 WORKFLOWS = {
@@ -31,6 +40,411 @@ WORKFLOWS = {
     "feature": "Plan and implement a feature with proportionate engineering rigor.",
     "review": "Independently assess a change; review is distinct from verification.",
 }
+HARNESS_RECORD = Path(".agent-managed/harness-adapters.json")
+AI_MEMORY_FILE = Path(".ai-memory.toml")
+AI_MEMORY_REQUIRED = ("workspace", "project", "drop_subagent_captures")
+SUPPORTED_HARNESSES = ("codex", "opencode", "copilot", "claude")
+HARNESS_DIRS = {
+    "codex": Path(".codex"),
+    "opencode": Path(".opencode"),
+    "copilot": Path(".github"),
+    "claude": Path(".claude"),
+}
+HARNESS_EXECUTABLES = {name: name for name in SUPPORTED_HARNESSES}
+SHELL_PATH_MARKER_START = "# >>> agent-kit managed PATH >>>"
+SHELL_PATH_MARKER_END = "# <<< agent-kit managed PATH <<<"
+OPEN_TASK_STATUSES = {
+    "pending", "ready", "implementing", "gates", "reviewing", "fixing",
+    "qa", "blocked", "escalated", "in_progress", "failed",
+}
+
+
+def qa_gate_permissions(profile: str) -> str:
+    """Return the deliberately small, read-only gate allow-list for QA."""
+    common = (
+        '    "git diff --check*": allow\n'
+        '    "git status --short*": allow'
+    )
+    profile_commands = {
+        "flutter": (
+            '    "dart format --output=none --set-exit-if-changed *": allow\n'
+            '    "flutter analyze*": allow\n'
+            '    "flutter test*": allow'
+        ),
+        "laravel": (
+            '    "php artisan test*": allow\n'
+            '    "./vendor/bin/pest*": allow\n'
+            '    "./vendor/bin/phpunit*": allow\n'
+            '    "./vendor/bin/pint --test*": allow'
+        ),
+        "kotlin-multiplatform": (
+            '    "./gradlew test*": allow\n'
+            '    "./gradlew :*test*": allow\n'
+            '    "./gradlew detekt*": allow'
+        ),
+    }
+    return "\n".join((common, profile_commands.get(profile, ""))).rstrip()
+
+
+def opencode_agent(role: str, mode: str, model: str, read_only: bool = False, *, profile: str = "generic") -> str:
+    base_role = role.removesuffix("-openai")
+    if base_role.startswith("qa-"):
+        base_role = "qa"
+    execution_provider = "openai" if role.endswith("-openai") else "opencode"
+    provider_guard = (
+        f"For a dispatched task, require `PROVIDER: {execution_provider}` in the payload. "
+        "If it names another provider, return `PROVIDER_MISMATCH` immediately; do not edit, run a gate, or retry."
+        if base_role.startswith("developer") or base_role in {"reviewer", "reviewer-specialist", "qa"} else ""
+    )
+    if read_only:
+        qa_bash = qa_gate_permissions(profile) if base_role == "qa" else '    "*": deny'
+        permissions = '''permission:
+  "*": deny
+  read: allow
+  glob: allow
+  grep: allow
+  list: allow
+  skill: allow
+  edit: deny
+  task: deny
+  bash:
+{QA_BASH}'''.replace("{QA_BASH}", qa_bash)
+    elif base_role == "orchestrator":
+        # The Orchestrator is the single writer for canonical state/evidence,
+        # not a second production implementer. Scope edits to feature artifacts.
+        permissions = '''permission:
+  read: allow
+  glob: allow
+  grep: allow
+  list: allow
+  skill: allow
+  edit:
+    "*": deny
+    ".specs/**": allow
+    "**/.specs/**": allow
+  task: allow
+  bash:
+    "*": ask
+    "git push*": deny
+    "git reset*": deny
+    "git clean*": deny
+    "git rebase*": deny
+    "git commit --amend*": deny'''
+    elif base_role == "planner":
+        # Planning is limited to edit-tool writes under .specs. Shell denial
+        # prevents redirection from bypassing the production-file boundary.
+        permissions = '''permission:
+  read: allow
+  glob: allow
+  grep: allow
+  list: allow
+  skill: allow
+  edit:
+    "*": deny
+    ".specs/**": allow
+    "**/.specs/**": allow
+  task: deny
+  bash:
+    "*": deny'''
+    else:
+        permissions = '''permission:
+  read: allow
+  glob: allow
+  grep: allow
+  list: allow
+  skill: allow
+  edit:
+    "*": allow
+    ".specs/**": deny
+    "**/.specs/**": deny
+  task: TASK_PERMISSION
+  bash:
+    "*": BASH_PERMISSION
+    "*state.py*": deny
+    "*routing.py*": deny
+    "git push*": deny
+    "git reset*": deny
+    "git clean*": deny
+    "git rebase*": deny
+    "git commit --amend*": deny'''.replace("TASK_PERMISSION", "deny").replace("BASH_PERMISSION", "ask")
+    instructions = {
+        "orchestrator": "Own decomposition, dependencies, canonical state/evidence reconciliation, review loop, QA, and final integration. Delegate all production work; never edit production code. Every dispatch includes owned paths or a diff boundary. For formal tasks, honor the workflow provider selector. Resolve production with `resolve <tasks.md> <task> opencode --provider <name>`; resolve Reviewer/QA with `resolve-class opencode <reviewClasses|qaClasses> <class> --provider <name>`. Every returned JSON is a hard dispatch contract: call only `exec.agent`, include `PROVIDER: exec.provider` in the Task payload, and stop if its provider differs from the requested provider. The provider constraint applies to Developer, Reviewer, and QA. A global gate failure only outside that boundary is `EXTERNAL_DIRTY_WORKTREE`: it blocks clean-worktree release evidence, not the evaluated task; never ask QA to edit/revert it. A quota/rate-limit/unavailable error is terminal for that child: do not ask it to retry or wait indefinitely. Immediately resolve again with `--exclude-model <failed-model>` and dispatch only the next candidate, retaining a named provider; `auto` may change provider. If the active harness cannot cancel an already pending child, mark it cancelled/blocked in canonical state, dispatch no dependent work, and report the required UI cancellation. No candidate is a blocker. Resolve project gates from profile and project rules.",
+        "planner": "Write only scoped specification, design, and task artifacts when required. Never edit canonical state/validation evidence, implement production code, or redefine project architecture.",
+        "developer-low": "Implement one bounded low-complexity task and add relevant tests. Run discovered development gates for the task scope: format when it can change touched files, then analysis/lint and focused tests. Return compact gate evidence and Developer Closure facts to the Orchestrator; never write planning/state artifacts.",
+        "developer": "Implement one bounded task and add relevant tests. Run discovered development gates for the task scope: format when it can change touched files, then analysis/lint and focused tests. Return compact gate evidence and Developer Closure facts to the Orchestrator; never write planning/state artifacts.",
+        "developer-high": "Implement one bounded high-risk task. Assess integrity, concurrency, compatibility, rollback, and failures. Run the project-required development gates and return compact closure evidence to the Orchestrator; never write planning/state artifacts.",
+        "developer-critical": "Implement one bounded critical-risk task. Escalate missing evidence or unsafe assumptions. Run the project-required development gates and return compact closure evidence to the Orchestrator; never write planning/state artifacts.",
+        "reviewer": "Fresh independent reviewer. Read-only. Return ranked, evidence-bearing findings to the Orchestrator; never fix code or self-approve.",
+        "reviewer-specialist": "Fresh independent specialist reviewer. Read-only. Review only the dispatched capability and return evidence to the Orchestrator.",
+        "qa": "Independent QA. Read-only. Execute only approved non-mutating verification and evaluate acceptance/failure scenarios from executable evidence; request an exact scenario run from the Orchestrator when evidence is missing. Before global gates, inspect task-owned paths/diff and worktree status. A failure only outside the dispatched boundary is `EXTERNAL_DIRTY_WORKTREE`: report command/path/boundary and scoped evidence; do not call the task defective, edit/reformat/revert it, or claim a clean-worktree verdict. Missing ownership evidence is BLOCKED. Never format or edit source, specs, tasks, state, handoffs, or validation reports. Return QAResult only; the Orchestrator owns canonical artifacts.",
+    }[base_role]
+    return f'''---
+description: "Shared {role} adapter; project policy remains external."
+mode: {mode}
+model: "{model}"
+reasoningEffort: {role_effort(base_role)}
+{permissions}
+---
+
+Load the dispatched role capsule, current project AGENTS.md, and only the relevant shared protocol/profile sections.
+{instructions}
+{provider_guard}
+Use Caveman handoffs: facts, paths, requirements, commands, results, risks, open items. Do not invent project commands or business rules.
+'''
+
+
+def codex_agent(role: str, model: str, effort: str, sandbox: str, description: str, instruction: str) -> str:
+    return f'''name = "{role}"
+description = "{description}"
+model = "{model}"
+model_reasoning_effort = "{effort}"
+sandbox_mode = "{sandbox}"
+developer_instructions = """
+Load the dispatched role capsule, project AGENTS.md, and only relevant shared protocol/profile sections.
+{instruction}
+Use compact evidence. Never invent project gates, architecture, or domain policy.
+"""
+'''
+
+
+def role_effort(role: str) -> str:
+    if role.startswith("developer") or role in {"qa", "orchestrator"}:
+        return "low"
+    return "medium"
+
+
+def portable_harness_routes(harness: str, default: str, *, strongest: str | None = None, cheapest: str | None = None) -> dict:
+    strongest = strongest or default
+    cheapest = cheapest or default
+    def route(agent: str, model: str, effort: str) -> dict:
+        return {"agent": agent, "model": model, "reasoningEffort": effort, "provider": harness}
+    return {
+        "schemaVersion": 1,
+        "modelClasses": {
+            "cost-efficient-coding": route("developer-low", cheapest, "low"),
+            "balanced-coding": route("developer", default, "low"),
+            "strong-coding": route("developer-high", strongest, "medium"),
+            "strongest-appropriate": route("developer-high", strongest, "medium"),
+        },
+        "reviewClasses": {
+            "independent-reviewer": route("reviewer", default, "medium"),
+            "specialist-review": route("reviewer", strongest, "medium"),
+        },
+        "qaClasses": {
+            "qa-basic": route("qa", cheapest, "low"),
+            "qa-targeted": route("qa", default, "low"),
+            "qa-adversarial": route("qa", strongest, "medium"),
+        },
+    }
+
+
+def copilot_agent(role: str, model: str, effort: str, read_only: bool) -> str:
+    restriction = "Read-only. Execute only approved non-mutating verification; do not edit files or project state." if role == "qa" else ("Do not edit files or project state." if read_only else "Respect the dispatched owned paths and project rules. Run discovered development gates before requesting review.")
+    tools = "[read, search, execute]" if role == "qa" else ("[read, search]" if read_only else ("[read, search, agent, execute]" if role == "orchestrator" else "[read, search, edit, execute]"))
+    model_line = "" if model == "auto" else f"model: {model}\n"
+    return f'''---
+name: {role}
+description: Shared {role} adapter; project policy remains external.
+{model_line}tools: {tools}
+user-invocable: true
+disable-model-invocation: true
+---
+
+Load the compact role capsule, project AGENTS.md, and only relevant managed protocol sections.
+Requested effort is `{effort}` in the approved DispatchPlan; Copilot has no portable agent-frontmatter effort field, so verify the effective execution receipt.
+{restriction}
+Return facts, paths, commands, results, risks, and open items. Never persist reasoning or transcripts.
+'''
+
+
+def claude_agent(role: str, model: str, effort: str, read_only: bool) -> str:
+    tools = "Read, Grep, Glob, Bash" if role == "qa" else ("Read, Grep, Glob" if read_only else ("Agent, Read, Grep, Glob, Bash" if role == "orchestrator" else "Read, Grep, Glob, Edit, Write, Bash"))
+    restriction = "Read-only. Execute only approved non-mutating verification; never modify files or canonical state." if role == "qa" else ("Read-only. Never modify files or canonical state." if read_only else "Modify only the dispatched owned paths and run discovered development gates before review.")
+    turn_limit = "" if role == "orchestrator" else "maxTurns: 8\n"
+    return f'''---
+name: {role}
+description: Shared {role} adapter with compact context.
+model: {model}
+effort: {effort}
+tools: {tools}
+{turn_limit}---
+
+Load the compact role capsule, project AGENTS.md, and only relevant managed protocol sections.
+{restriction}
+Return compact evidence without transcripts or hidden reasoning.
+'''
+
+
+def portable_workflow_prompt(workflow: str, description: str, harness: str) -> str:
+    return f'''---
+description: {json.dumps(description)}
+---
+
+{COMMAND_MARKER_START} workflow={workflow} -->
+Load `.agent-managed/agent-engineering-framework/workflows/{workflow}.md`.
+Before any agent dispatch, run `agent-kit {workflow} $ARGUMENTS --harness {harness} --propose --json`, present its model matrix, and wait for approval.
+Dispatch only an approved plan and record the effective model/provider receipt.
+Harness: {harness}. Project rules and canonical state remain external.
+{COMMAND_MARKER_END}
+'''
+
+
+def harness_templates(
+    harness: str,
+    *,
+    profile: str = "generic",
+    orchestrator_model: str | None = None,
+) -> dict[str, str]:
+    if harness == "opencode":
+        templates = {
+            "opencode.json": json.dumps({"$schema": "https://opencode.ai/config.json", "default_agent": "orchestrator", "skills": {"paths": ["~/.agents/skills/tlc-spec-driven", "~/.agents/skills/caveman", ".agent-managed/agent-engineering-framework/skills"]}}, indent=2) + "\n",
+            "gates.md": "# OpenCode gates adapter\n\nCanonical commands and policy: project rules, selected profile, and `docs/engineering-gates.md` when present. Do not define project commands here.\n",
+            "routing.json": json.dumps({"schemaVersion": 1, "modelClasses": {"cost-efficient-coding": {"candidates": [{"agent": "developer-low", "model": "opencode/mimo-v2.5-free", "provider": "opencode"}, {"agent": "developer", "model": "opencode/big-pickle", "provider": "opencode"}, {"agent": "developer-low-openai", "model": "openai/gpt-5.6-luna", "provider": "openai"}]}, "balanced-coding": {"candidates": [{"agent": "developer", "model": "opencode/big-pickle", "provider": "opencode"}, {"agent": "developer-high", "model": "opencode/muse-spark-1.3-contributor-free", "provider": "opencode"}, {"agent": "developer-critical", "model": "opencode/nemotron-3-ultra-free", "provider": "opencode"}, {"agent": "developer-openai", "model": "openai/gpt-5.5", "provider": "openai"}]}, "strong-coding": {"candidates": [{"agent": "developer-high", "model": "opencode/muse-spark-1.3-contributor-free", "provider": "opencode"}, {"agent": "developer-critical", "model": "opencode/nemotron-3-ultra-free", "provider": "opencode"}, {"agent": "developer-high-openai", "model": "openai/gpt-5.6-sol", "provider": "openai"}]}, "strongest-appropriate": {"candidates": [{"agent": "developer-critical", "model": "opencode/nemotron-3-ultra-free", "provider": "opencode"}, {"agent": "developer-high", "model": "opencode/muse-spark-1.3-contributor-free", "provider": "opencode"}, {"agent": "developer-critical-openai", "model": "openai/gpt-6-astra", "provider": "openai"}]}}, "reviewClasses": {"independent-reviewer": {"candidates": [{"agent": "reviewer", "model": "opencode/nemotron-3-ultra-free", "provider": "opencode"}, {"agent": "reviewer-openai", "model": "openai/gpt-5.6-terra", "provider": "openai"}]}, "specialist-review": {"candidates": [{"agent": "reviewer-specialist", "model": "opencode/muse-spark-1.3-contributor-free", "provider": "opencode"}, {"agent": "reviewer-specialist-openai", "model": "openai/gpt-5.6-sol", "provider": "openai"}]}}, "qaClasses": {"qa-basic": {"candidates": [{"agent": "qa-basic", "model": "opencode/mimo-v2.5-free", "provider": "opencode"}, {"agent": "qa-basic-openai", "model": "openai/gpt-5.6-luna", "provider": "openai"}]}, "qa-targeted": {"candidates": [{"agent": "qa-targeted", "model": "opencode/big-pickle", "provider": "opencode"}, {"agent": "qa-targeted-openai", "model": "openai/gpt-5.5", "provider": "openai"}]}, "qa-adversarial": {"candidates": [{"agent": "qa-adversarial", "model": "opencode/nemotron-3-ultra-free", "provider": "opencode"}, {"agent": "qa-adversarial-openai", "model": "openai/gpt-5.6-sol", "provider": "openai"}]} }}, indent=2) + "\n",
+        }
+        roles = (("orchestrator", "primary", orchestrator_model or "opencode/nemotron-3-ultra-free", False), ("planner", "subagent", "opencode/muse-spark-1.3-contributor-free", False), ("developer-low", "subagent", "opencode/mimo-v2.5-free", False), ("developer", "subagent", "opencode/big-pickle", False), ("developer-high", "subagent", "opencode/muse-spark-1.3-contributor-free", False), ("developer-critical", "subagent", "opencode/nemotron-3-ultra-free", False), ("developer-low-openai", "subagent", "openai/gpt-5.6-luna", False), ("developer-openai", "subagent", "openai/gpt-5.5", False), ("developer-high-openai", "subagent", "openai/gpt-5.6-sol", False), ("developer-critical-openai", "subagent", "openai/gpt-6-astra", False), ("reviewer", "subagent", "opencode/nemotron-3-ultra-free", True), ("reviewer-specialist", "subagent", "opencode/muse-spark-1.3-contributor-free", True), ("reviewer-openai", "subagent", "openai/gpt-5.6-terra", True), ("reviewer-specialist-openai", "subagent", "openai/gpt-5.6-sol", True), ("qa", "subagent", "opencode/mimo-v2.5-free", True), ("qa-basic", "subagent", "opencode/mimo-v2.5-free", True), ("qa-targeted", "subagent", "opencode/big-pickle", True), ("qa-adversarial", "subagent", "opencode/nemotron-3-ultra-free", True), ("qa-basic-openai", "subagent", "openai/gpt-5.6-luna", True), ("qa-targeted-openai", "subagent", "openai/gpt-5.5", True), ("qa-adversarial-openai", "subagent", "openai/gpt-5.6-sol", True))
+        templates.update({f"agents/{role}.md": opencode_agent(role, mode, model, readonly, profile=profile) for role, mode, model, readonly in roles})
+        return templates
+    if harness == "codex":
+        routes = {
+            "schemaVersion": 1,
+            "modelClasses": {
+                "cost-efficient-coding": {"agent": "developer-low", "model": "gpt-5.6-luna", "reasoningEffort": "low", "provider": "openai"},
+                "balanced-coding": {"agent": "developer-medium", "model": "gpt-5.5", "reasoningEffort": "low", "provider": "openai"},
+                "strong-coding": {"agent": "developer-high", "model": "gpt-5.6-sol", "reasoningEffort": "medium", "provider": "openai"},
+                "strongest-appropriate": {"agent": "developer-high", "model": "gpt-5.6-sol", "reasoningEffort": "medium", "provider": "openai"},
+            },
+            "reviewClasses": {
+                "independent-reviewer": {"agent": "reviewer", "model": "gpt-5.6-terra", "reasoningEffort": "medium", "provider": "openai"},
+                "specialist-review": {"agent": "reviewer", "model": "gpt-5.6-sol", "reasoningEffort": "medium", "provider": "openai"},
+            },
+            "qaClasses": {
+                "qa-basic": {"agent": "qa", "model": "gpt-5.6-luna", "reasoningEffort": "low", "provider": "openai"},
+                "qa-targeted": {"agent": "qa", "model": "gpt-5.6-terra", "reasoningEffort": "low", "provider": "openai"},
+                "qa-adversarial": {"agent": "qa", "model": "gpt-5.6-sol", "reasoningEffort": "low", "provider": "openai"},
+            },
+        }
+        templates = {
+            "config.toml": "# agent-framework-harness: codex-config\n[agents]\nenabled = true\nmax_concurrent_threads_per_session = 3\n",
+            "routing.json": json.dumps(routes, indent=2) + "\n",
+        }
+        roles = (("orchestrator", orchestrator_model or "gpt-5.6-sol", "low", "workspace-write", "Shared task conductor.", "Own decomposition, dependencies, canonical state/evidence, review/verification, and final integration. Before dispatch, present the model-selection proposal and wait for approval. Delegate all production work; never edit production code."), ("planner", "gpt-5.6-sol", "medium", "workspace-write", "Shared specification planner.", "Write scoped planning artifacts only; never edit canonical state/validation evidence or production code."), ("developer_low", "gpt-5.6-luna", "low", "workspace-write", "Low-complexity task implementer.", "Implement one dispatched task and relevant tests. Run discovered format, analysis/lint, and focused tests where required before review; never edit .specs artifacts. Return compact closure evidence to the Orchestrator."), ("developer_medium", "gpt-5.5", "low", "workspace-write", "Medium-complexity task implementer.", "Implement one dispatched task and relevant tests. Run discovered development gates before review; never edit .specs artifacts. Return compact closure evidence to the Orchestrator."), ("developer_high", "gpt-5.6-sol", "medium", "workspace-write", "High-risk task implementer.", "Implement one dispatched task and relevant tests. Assess integrity, compatibility, concurrency, and rollback where relevant. Run project-required development gates and return compact closure evidence; never edit .specs artifacts."), ("reviewer", "gpt-5.6-terra", "medium", "read-only", "Independent read-only reviewer.", "Review independently; return one complete, evidence-bearing finding batch only. Never edit, self-approve, or write project artifacts."), ("qa", "gpt-5.6-luna", "low", "read-only", "Independent read-only QA.", "Execute approved non-mutating verification and evaluate acceptance/failure evidence independently. Never edit, format, refactor, or write project artifacts."))
+        templates.update({f"agents/{role[0].replace('_', '-')}.toml": codex_agent(*role) for role in roles})
+        return templates
+    if harness == "copilot":
+        routes = portable_harness_routes("copilot", "auto")
+        templates = {
+            "routing.json": json.dumps(routes, indent=2) + "\n",
+            "instructions/agent-framework.instructions.md": "---\napplyTo: '**'\n---\nLoad project AGENTS.md and the managed engineering workflow. Use only the approved DispatchPlan and compact role capsule.\n",
+        }
+        for role, read_only in (("orchestrator", False), ("planner", False), ("developer-low", False), ("developer", False), ("developer-high", False), ("reviewer", True), ("qa", True)):
+            effort = role_effort(role)
+            model = orchestrator_model if role == "orchestrator" and orchestrator_model else "auto"
+            templates[f"agents/{role}.agent.md"] = copilot_agent(role, model, effort, read_only)
+        for workflow, description in WORKFLOWS.items():
+            templates[f"prompts/{workflow}.prompt.md"] = portable_workflow_prompt(workflow, description, "copilot")
+        return templates
+    if harness == "claude":
+        routes = portable_harness_routes("claude", "sonnet", strongest="opus", cheapest="haiku")
+        templates = {"routing.json": json.dumps(routes, indent=2) + "\n"}
+        role_models = {"orchestrator": orchestrator_model or "opus", "planner": "sonnet", "developer-low": "haiku", "developer": "sonnet", "developer-high": "opus", "reviewer": "sonnet", "qa": "haiku"}
+        for role, model in role_models.items():
+            templates[f"agents/{role}.md"] = claude_agent(role, model, role_effort(role), role in {"reviewer", "qa"})
+        for workflow, description in WORKFLOWS.items():
+            templates[f"commands/{workflow}.md"] = portable_workflow_prompt(workflow, description, "claude")
+        return templates
+    raise ValueError(harness)
+
+
+def sync_harness_adapters(root: Path, data: dict, *, replace_managed: bool = False) -> list[str]:
+    if data.get("harness", {}).get("managed_adapters", True) is False:
+        return []
+    record_path = root / HARNESS_RECORD
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8")) if record_path.is_file() else {}
+    except json.JSONDecodeError:
+        if replace_managed:
+            record = {}
+        else:
+            fail(f"invalid managed harness record: {record_path}")
+    if not isinstance(record, dict):
+        if replace_managed:
+            record = {}
+        else:
+            fail(f"invalid managed harness record: {record_path}")
+    planned: list[tuple[str, Path, bytes, bytes | None, str | None]] = []
+    for harness in data["harnesses"]:
+        for relative, content in harness_templates(
+            harness,
+            profile=data["profile"],
+            orchestrator_model=data.get("orchestrator_model") if harness == data["harnesses"][0] else None,
+        ).items():
+            target_relative = (HARNESS_DIRS[harness] / relative).as_posix()
+            target = root / target_relative
+            expected = content.encode("utf-8")
+            current = target.read_bytes() if target.is_file() else None
+            known = record.get(target_relative)
+            if current == expected:
+                record[target_relative] = hashlib.sha256(expected).hexdigest()
+                continue
+            if current is not None:
+                current_digest = hashlib.sha256(current).hexdigest()
+                if known is not None and known != current_digest:
+                    if not replace_managed:
+                        fail(f"managed harness adapter modified: {target}; use `agent-kit sync --replace-managed` to back it up and restore the managed adapter, or move project extensions outside managed paths")
+                if known is None:
+                    backup_once(root, target, f"{harness}-{relative.replace('/', '-').replace('.', '_')}.before-agent-framework")
+            planned.append((target_relative, target, expected, current, known))
+    # Validate every managed target before writing any of them. A stale adapter
+    # must never leave a consumer with a partially upgraded harness tree.
+    for target_relative, target, _expected, current, known in planned:
+        if current is not None and known is not None and known != hashlib.sha256(current).hexdigest() and replace_managed:
+            backup_once(root, target, f"{target_relative.replace('/', '-').replace('.', '_')}.before-replace-managed")
+    changed: list[str] = []
+    for target_relative, target, expected, _current, _known in planned:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(expected)
+        record[target_relative] = hashlib.sha256(expected).hexdigest()
+        changed.append(target_relative)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return changed
+
+
+def prune_obsolete_managed_adapters(root: Path, data: dict) -> list[str]:
+    """Remove only obsolete files named by the ownership ledger.
+
+    Harness directories are never removed recursively, so project extensions in
+    `.opencode`, `.codex`, `.github`, or `.claude` remain outside this operation.
+    """
+    record_path = root / HARNESS_RECORD
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8")) if record_path.is_file() else {}
+    except json.JSONDecodeError:
+        fail(f"invalid managed harness record: {record_path}")
+    expected = {
+        (HARNESS_DIRS[harness] / relative).as_posix()
+        for harness in data["harnesses"]
+        for relative in harness_templates(
+            harness,
+            profile=data["profile"],
+            orchestrator_model=data.get("orchestrator_model") if harness == data["harnesses"][0] else None,
+        )
+    }
+    if "opencode" in data["harnesses"]:
+        expected.update((Path(".opencode/commands") / f"{workflow}.md").as_posix() for workflow in WORKFLOWS)
+    removed: list[str] = []
+    for relative in sorted(set(record) - expected):
+        candidate = Path(relative)
+        if candidate.is_absolute() or ".." in candidate.parts or not any(candidate.is_relative_to(directory) for directory in HARNESS_DIRS.values()):
+            fail(f"unsafe path in managed harness record: {relative}")
+        target = root / candidate
+        if target.is_file() or target.is_symlink():
+            remove_path(target)
+            removed.append(relative)
+        record.pop(relative, None)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return removed
 
 
 def fail(message: str) -> None:
@@ -112,29 +526,304 @@ def parse_manifest(root: Path) -> dict:
         fail("manifest profile must be a string")
     profile_path(profile)
     harnesses = data.get("harnesses")
-    if not isinstance(harnesses, list) or any(item not in {"codex", "opencode"} for item in harnesses):
-        fail("manifest harnesses must be a list containing only codex/opencode")
+    if not isinstance(harnesses, list) or not harnesses or any(item not in SUPPORTED_HARNESSES for item in harnesses):
+        fail("manifest harnesses must contain codex, opencode, copilot, or claude")
+    harness_settings = data.get("harness", {})
+    if harness_settings and (not isinstance(harness_settings, dict) or not isinstance(harness_settings.get("managed_adapters", True), bool)):
+        fail("harness.managed_adapters must be boolean")
+    state_settings = data.get("state", {})
+    if state_settings:
+        if not isinstance(state_settings, dict) or state_settings.get("provider", "framework") not in {"framework", "project"}:
+            fail("state.provider must be framework or project")
+        if "path" in state_settings and not isinstance(state_settings["path"], str):
+            fail("state.path must be a string")
+        if "command" in state_settings and not isinstance(state_settings["command"], str):
+            fail("state.command must be a string")
+    if not isinstance(data.get("ai_memory", True), bool):
+        fail("manifest ai_memory must be boolean")
+    if data.get("orchestrator_model") is not None and not isinstance(data.get("orchestrator_model"), str):
+        fail("manifest orchestrator_model must be a string")
     return data
 
 
-def write_manifest(root: Path, profile: str, harnesses: list[str]) -> None:
+def replace_manifest_value(text: str, key: str, value: str) -> str:
+    pattern = re.compile(rf"^{re.escape(key)}\s*=.*$", re.MULTILINE)
+    if pattern.search(text):
+        return pattern.sub(f"{key} = {value}", text, count=1)
+    return f"{key} = {value}\n{text}"
+
+
+def write_manifest(
+    root: Path,
+    profile: str,
+    harnesses: list[str],
+    *,
+    force: bool = False,
+    orchestrator_model: str | None = None,
+) -> None:
     path = manifest_path(root)
     if path.exists():
-        data = parse_manifest(root)
-        if data["profile"] != profile:
-            fail(f"existing profile is {data['profile']!r}; do not overwrite project manifest")
-        return
-    text = (FRAMEWORK / "templates/agent-framework.toml").read_text(encoding="utf-8")
-    text = text.replace('profile = "generic"', f'profile = "{profile}"')
-    text = text.replace('harnesses = ["codex", "opencode"]', "harnesses = [" + ", ".join(f'"{item}"' for item in harnesses) + "]")
+        if not force:
+            data = parse_manifest(root)
+            if data["profile"] != profile:
+                fail(f"existing profile is {data['profile']!r}; do not overwrite project manifest")
+            return
+        try:
+            text = path.read_text(encoding="utf-8")
+            load_toml(path)
+        except (OSError, SystemExit):
+            text = (FRAMEWORK / "templates/agent-framework.toml").read_text(encoding="utf-8")
+    else:
+        text = (FRAMEWORK / "templates/agent-framework.toml").read_text(encoding="utf-8")
+    text = replace_manifest_value(text, "framework_version", f'"{MAJOR}"')
+    text = replace_manifest_value(text, "profile", f'"{profile}"')
+    text = replace_manifest_value(text, "harnesses", "[" + ", ".join(f'"{item}"' for item in harnesses) + "]")
+    if orchestrator_model:
+        text = replace_manifest_value(text, "orchestrator_model", json.dumps(orchestrator_model))
     path.write_text(text, encoding="utf-8")
+
+
+def normalize_identifier(value: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip("-._")
+    return normalized or "project"
+
+
+def git_remote_parts(root: Path) -> tuple[str | None, str | None]:
+    try:
+        top = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], cwd=root, text=True,
+            capture_output=True, timeout=3, check=False,
+        )
+        if top.returncode != 0 or Path(top.stdout.strip()).resolve() != root.resolve():
+            return None, None
+        result = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            cwd=root,
+            text=True,
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None, None
+    remote = result.stdout.strip()
+    if not remote:
+        return None, None
+    path = re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://[^/]+/", "", remote)
+    path = re.sub(r"^[^@]+@[^:]+:", "", path).removesuffix(".git").strip("/")
+    parts = [part for part in path.split("/") if part]
+    return (parts[-2] if len(parts) > 1 else None, parts[-1] if parts else None)
+
+
+def memory_identity(root: Path, workspace: str | None, project: str | None, *, interactive: bool = True) -> tuple[str, str, str]:
+    remote_workspace, remote_project = git_remote_parts(root)
+    suggested_workspace = normalize_identifier(remote_workspace or root.parent.name)
+    suggested_project = normalize_identifier(remote_project or root.name)
+    source = "flags" if workspace or project else ("git" if remote_project else "path")
+    selected_workspace = normalize_identifier(workspace or suggested_workspace)
+    selected_project = normalize_identifier(project or suggested_project)
+    if interactive and sys.stdin.isatty():
+        if workspace is None:
+            selected_workspace = normalize_identifier(input(f"ai-memory workspace [{selected_workspace}]: ").strip() or selected_workspace)
+        if project is None:
+            selected_project = normalize_identifier(input(f"ai-memory project [{selected_project}]: ").strip() or selected_project)
+    return selected_workspace, selected_project, source
+
+
+def profile_memory_ignores(profile: str) -> tuple[str, ...]:
+    additions = {
+        "laravel": ("storage/oauth-private.key", "storage/oauth-public.key", "storage/**/*.key"),
+        "flutter": ("android/key.properties", "android/**/*.jks", "android/**/*.keystore"),
+        "kotlin-multiplatform": ("android/key.properties", "android/**/*.jks", "android/**/*.keystore"),
+    }
+    return additions.get(profile, ())
+
+
+def render_ai_memory(root: Path, profile: str, workspace: str | None, project: str | None, *, interactive: bool = True) -> tuple[str, str]:
+    selected_workspace, selected_project, source = memory_identity(root, workspace, project, interactive=interactive)
+    text = (FRAMEWORK / "templates/ai-memory.toml").read_text(encoding="utf-8")
+    text = text.replace("<workspace>", selected_workspace).replace("<project>", selected_project)
+    additions = profile_memory_ignores(profile)
+    if additions:
+        rendered = "".join(f'    "{value}",\n' for value in additions)
+        text = text.replace("    \"**/*.keystore\"\n]", "    \"**/*.keystore\",\n" + rendered.rstrip("\n,\n") + "\n]")
+    return text, source
+
+
+def ai_memory_validation(path: Path) -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    if not path.is_file():
+        return [".ai-memory.toml missing; run agent-kit sync"], warnings
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        return [f"cannot read .ai-memory.toml: {error}"], warnings
+    if tomllib is not None:
+        try:
+            with path.open("rb") as stream:
+                data = tomllib.load(stream)
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            return [f"invalid .ai-memory.toml: {error}"], warnings
+        for key in AI_MEMORY_REQUIRED:
+            value = data.get(key)
+            if value is None or value == "":
+                errors.append(f".ai-memory.toml missing {key}")
+    else:  # Strict validation for the template subset on Python 3.9/3.10.
+        in_array = False
+        for number, raw in enumerate(text.splitlines(), 1):
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if in_array:
+                if line == "]":
+                    in_array = False
+                elif not re.fullmatch(r'"(?:[^"\\]|\\.)*",?', line):
+                    errors.append(f"invalid .ai-memory.toml:{number}")
+                continue
+            if re.fullmatch(r"\[[A-Za-z0-9_.-]+\]", line):
+                continue
+            assignment = re.fullmatch(r"[A-Za-z0-9_-]+\s*=\s*(.+)", line)
+            if not assignment:
+                errors.append(f"invalid .ai-memory.toml:{number}")
+                continue
+            raw_value = assignment.group(1).strip()
+            if raw_value == "[":
+                in_array = True
+            elif not (
+                re.fullmatch(r'"(?:[^"\\]|\\.)*"', raw_value)
+                or raw_value in {"true", "false"}
+                or re.fullmatch(r"\d+", raw_value)
+            ):
+                errors.append(f"invalid .ai-memory.toml:{number}")
+        if in_array:
+            errors.append("invalid .ai-memory.toml: unterminated array")
+        for key in AI_MEMORY_REQUIRED:
+            if not re.search(rf"^{re.escape(key)}\s*=\s*(?:\"[^\"]+\"|true)\s*$", text, re.MULTILINE):
+                errors.append(f".ai-memory.toml missing {key}")
+    lowered = text.lower()
+    if '".env"' not in lowered or "secret" not in lowered or not any(ext in lowered for ext in ("*.pem", "*.key", "*.jks", "*.keystore")):
+        warnings.append(".ai-memory.toml capture.ignore_paths lacks recommended secret protections")
+    return errors, warnings
+
+
+def ensure_ai_memory_config(root: Path, data: dict, args: argparse.Namespace) -> tuple[str, str | None]:
+    if data.get("ai_memory", True) is False:
+        return "disabled", None
+    path = root / AI_MEMORY_FILE
+    if path.exists():
+        errors, _warnings = ai_memory_validation(path)
+        return ("invalid", "; ".join(errors)) if errors else ("preserved", None)
+    text, source = render_ai_memory(
+        root,
+        data["profile"],
+        getattr(args, "memory_workspace", None),
+        getattr(args, "memory_project", None),
+        interactive=not bool(getattr(args, "yes", False)),
+    )
+    path.write_text(text, encoding="utf-8")
+    return "created", source
+
+
+def ensure_model_catalog(root: Path, data: dict, args: argparse.Namespace, *, force: bool = False) -> tuple[str, dict]:
+    lock = root / model_catalog.LOCK_PATH
+    reuse = bool(getattr(args, "reuse_model_lock", False))
+    refresh = bool(getattr(args, "refresh_models", False) or getattr(args, "discover_models", False))
+    if lock.is_file() and (reuse or (not force and not refresh)):
+        try:
+            value = model_catalog.load_catalog(root)
+            errors = model_catalog.validate_catalog(value, data["harnesses"])
+            if not errors:
+                return "reused" if reuse else "preserved", value
+        except ValueError:
+            if reuse:
+                fail("--reuse-model-lock requires a valid lock for every selected harness")
+    discover = bool(getattr(args, "discover_models", False) or sys.stdin.isatty())
+    try:
+        value = model_catalog.refresh(root, data["harnesses"], discover=discover)
+    except ValueError as error:
+        fail(str(error))
+    return "refreshed" if force or refresh else "created", value
+
+
+def select_orchestrator_model(root: Path, data: dict, catalog: dict, requested: str | None) -> str:
+    configured = requested or data.get("orchestrator_model")
+    primary = data["harnesses"][0]
+    models = catalog.get("harnesses", {}).get(primary, {}).get("models", [])
+    available = [value for value in models if isinstance(value, dict) and value.get("available", True)]
+    if configured:
+        match = next((value for value in available if value.get("id") == configured), None)
+        if match is None:
+            fail(f"ORCHESTRATOR_UNAVAILABLE: {configured!r} is not available in control harness {primary}")
+        classes = match.get("classes", [])
+        if not any(value in {"strong-coding", "strongest-appropriate"} for value in classes):
+            fail(f"orchestrator model {configured!r} is below the strong control-plane floor")
+        return str(configured)
+    mapping = json.loads((root / HARNESS_DIRS[primary] / "routing.json").read_text(encoding="utf-8"))
+    entry = mapping.get("modelClasses", {}).get("strongest-appropriate", {})
+    candidates = entry.get("candidates") if isinstance(entry, dict) else None
+    options = candidates if isinstance(candidates, list) else [entry]
+    for option in options:
+        if isinstance(option, dict) and any(value.get("id") == option.get("model") for value in available):
+            return str(option["model"])
+    fail(f"ORCHESTRATOR_UNAVAILABLE: no strongest-appropriate model for control harness {primary}")
+
+
+def persist_orchestrator_model(root: Path, model: str) -> None:
+    path = manifest_path(root)
+    text = path.read_text(encoding="utf-8")
+    updated = replace_manifest_value(text, "orchestrator_model", json.dumps(model))
+    if updated != text:
+        path.write_text(updated, encoding="utf-8")
+
+
+def preflight_reinstall_catalog(
+    root: Path,
+    profile: str,
+    harnesses: list[str],
+    args: argparse.Namespace,
+    configured_orchestrator: str | None,
+) -> tuple[dict, str, str]:
+    """Stage harness mappings and validate model availability before project writes."""
+    if args.reuse_model_lock:
+        try:
+            value = model_catalog.load_catalog(root)
+        except ValueError as error:
+            fail(f"--reuse-model-lock requires a valid lock: {error}")
+        errors = model_catalog.validate_catalog(value, harnesses)
+        if errors:
+            fail("--reuse-model-lock: " + "; ".join(errors))
+        status = "reused"
+    else:
+        value = None
+        status = "refreshed"
+    with tempfile.TemporaryDirectory(prefix="agent-kit-reinstall-") as raw:
+        staged = Path(raw)
+        for harness in harnesses:
+            for relative, content in harness_templates(harness, profile=profile).items():
+                target = staged / HARNESS_DIRS[harness] / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+        if value is None:
+            discover = bool(args.discover_models or sys.stdin.isatty())
+            value = model_catalog.build_catalog(staged, harnesses, discover=discover)
+            errors = model_catalog.validate_catalog(value, harnesses)
+            if errors:
+                fail("reinstall model preflight failed: " + "; ".join(errors))
+        selected = select_orchestrator_model(
+            staged,
+            {"harnesses": harnesses},
+            value,
+            args.orchestrator_model or configured_orchestrator,
+        )
+        return value, status, selected
 
 
 def managed_block() -> str:
     return (FRAMEWORK / "templates/agents-managed-block.md").read_text(encoding="utf-8").strip()
 
 
-def sync_agents(root: Path, backup: bool) -> bool:
+def sync_agents(root: Path, backup: bool, *, force: bool = False) -> bool:
     path = root / "AGENTS.md"
     if path.exists():
         original = path.read_text(encoding="utf-8")
@@ -142,7 +831,14 @@ def sync_agents(root: Path, backup: bool) -> bool:
         original = ""
     starts, ends = original.count(MARKER_START), original.count(MARKER_END)
     if starts != ends or starts > 1:
-        fail("AGENTS.md has malformed or duplicate agent-framework markers")
+        if not force:
+            fail("AGENTS.md has malformed or duplicate agent-framework markers")
+        original = re.sub(
+            re.escape(MARKER_START) + r"[\s\S]*?" + re.escape(MARKER_END),
+            "",
+            original,
+        ).replace(MARKER_START, "").replace(MARKER_END, "")
+        starts = ends = 0
     block = managed_block()
     if starts == 1:
         before, rest = original.split(MARKER_START, 1)
@@ -175,6 +871,29 @@ def project_workflow_hook(data: dict, workflow: str) -> str | None:
     return hook
 
 
+def configured_providers(root: Path, harness: str) -> list[str]:
+    path = root / HARNESS_DIRS[harness] / "routing.json"
+    try:
+        mapping = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    providers: set[str] = set()
+    for family in ("modelClasses", "reviewClasses", "qaClasses"):
+        routes = mapping.get(family, {}) if isinstance(mapping, dict) else {}
+        if not isinstance(routes, dict):
+            continue
+        for route in routes.values():
+            if not isinstance(route, dict):
+                continue
+            candidates = route.get("candidates")
+            options = candidates if isinstance(candidates, list) else [route]
+            for option in options:
+                provider = option.get("provider") if isinstance(option, dict) else None
+                if isinstance(provider, str) and provider:
+                    providers.add(provider)
+    return sorted(providers)
+
+
 def managed_command(workflow: str, description: str, hook: str | None = None) -> str:
     lines = [
         "---",
@@ -187,6 +906,9 @@ def managed_command(workflow: str, description: str, hook: str | None = None) ->
         "Load only the relevant engineering-protocol, profile, and project rules it routes to.",
         "This is a generated adapter; do not redefine workflow semantics here.",
         "Intent or feature reference: `$ARGUMENTS`.",
+        "Optional execution-provider selector: `<feature-or-intent> [auto|openai|opencode|openrouter|copilot|claude]` or `--provider=<name>`.",
+        f"Before any Task dispatch, run `agent-kit {workflow} $ARGUMENTS --harness opencode --propose --json`, present the proposal, and dispatch only an explicitly approved DispatchPlan.",
+        "Provider is a hard dispatch constraint: resolve before Task; dispatch only the exact returned `exec.agent` with `PROVIDER: exec.provider`. If this cannot be done, stop without a production dispatch.",
     ]
     if hook:
         lines.append(f"Project-owned post-workflow hook: `{hook}`.")
@@ -206,6 +928,8 @@ def managed_codex_prompt(workflow: str, description: str) -> str:
         "Load only the relevant engineering-protocol, profile, and project rules it routes to.",
         "This is a generated adapter; do not redefine workflow semantics here.",
         "Intent or feature reference: `$ARGUMENTS`.",
+        "Optional execution-provider selector: `<feature-or-intent> [auto|openai|opencode|openrouter|copilot|claude]` or `--provider=<name>`.",
+        f"Before any subagent dispatch, run `agent-kit {workflow} $ARGUMENTS --harness codex --propose --json`, present the proposal, and dispatch only an explicitly approved DispatchPlan.",
         COMMAND_MARKER_END,
         "",
     ))
@@ -218,25 +942,36 @@ def backup_once(root: Path, source: Path, name: str) -> None:
         backup.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
 
 
-def sync_opencode_commands(root: Path, data: dict, backup: bool) -> list[str]:
+def sync_opencode_commands(root: Path, data: dict, backup: bool, *, force: bool = False) -> list[str]:
     enabled = "opencode" in data["harnesses"]
     if not enabled:
         return []
     changed: list[str] = []
     commands = root / ".opencode" / "commands"
+    record_path = root / HARNESS_RECORD
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8")) if record_path.is_file() else {}
+    except json.JSONDecodeError:
+        fail(f"invalid managed harness record: {record_path}")
+    if not isinstance(record, dict):
+        fail(f"invalid managed harness record: {record_path}")
     for workflow, description in WORKFLOWS.items():
         target = commands / f"{workflow}.md"
+        target_relative = target.relative_to(root).as_posix()
         expected = managed_command(workflow, description, project_workflow_hook(data, workflow))
         current = target.read_text(encoding="utf-8") if target.exists() else ""
         owned = COMMAND_MARKER_START in current and COMMAND_MARKER_END in current
         if target.exists() and not owned:
-            if not backup:
+            if not backup and not force:
                 fail(f"refusing to replace unmanaged OpenCode command: {target}")
             backup_once(root, target, f"opencode-{workflow}.md.before-agent-framework")
         if current != expected:
             commands.mkdir(parents=True, exist_ok=True)
             target.write_text(expected, encoding="utf-8")
             changed.append(workflow)
+        record[target_relative] = hashlib.sha256(expected.encode("utf-8")).hexdigest()
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return changed
 
 
@@ -259,7 +994,7 @@ def sync_codex_prompts() -> list[str]:
     return changed
 
 
-def copy_assets(root: Path, profile: str) -> None:
+def copy_assets(root: Path, profile: str, *, force: bool = False) -> None:
     destination = root / MANAGED_REL
     parent = destination.parent
     parent.mkdir(parents=True, exist_ok=True)
@@ -286,8 +1021,11 @@ def copy_assets(root: Path, profile: str) -> None:
             shutil.rmtree(previous)
         if destination.exists():
             if not (destination / "metadata.toml").is_file():
-                fail(f"refusing to replace unmanaged directory: {destination}")
-            os.replace(destination, previous)
+                if not force:
+                    fail(f"refusing to replace unmanaged directory: {destination}")
+                remove_path(destination)
+            else:
+                os.replace(destination, previous)
         os.replace(temp, destination)
         if previous.exists():
             shutil.rmtree(previous)
@@ -309,25 +1047,284 @@ def expected_digest(profile: str) -> str:
         return tree_digest(temporary_root / MANAGED_REL)
 
 
+def remove_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif path.exists() or path.is_symlink():
+        path.unlink()
+
+
+def reinstall_paths(root: Path, harnesses: list[str]) -> list[Path]:
+    paths = {
+        root / ".agent-framework.toml",
+        root / "AGENTS.md",
+        root / AI_MEMORY_FILE,
+        root / MANAGED_REL,
+        root / HARNESS_RECORD,
+        root / model_catalog.LOCK_PATH,
+    }
+    try:
+        record = json.loads((root / HARNESS_RECORD).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        record = {}
+    if isinstance(record, dict):
+        for relative in record:
+            if isinstance(relative, str) and relative and not Path(relative).is_absolute() and ".." not in Path(relative).parts:
+                paths.add(root / relative)
+    for harness in harnesses:
+        for relative in harness_templates(harness).keys():
+            paths.add(root / HARNESS_DIRS[harness] / relative)
+    for workflow in WORKFLOWS:
+        paths.add(root / ".opencode" / "commands" / f"{workflow}.md")
+    return sorted(paths, key=lambda value: (len(value.parts), str(value)))
+
+
+def create_reinstall_backup(root: Path, paths: list[Path]) -> tuple[Path, dict[str, str]]:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    backup = root / ".agent-managed" / "backups" / f"reinstall-{stamp}"
+    files = backup / "files"
+    inventory: dict[str, str] = {}
+    for path in paths:
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            continue
+        key = relative.as_posix()
+        if path.is_dir() and not path.is_symlink():
+            target = files / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(path, target)
+            inventory[key] = "directory"
+        elif path.exists() or path.is_symlink():
+            target = files / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+            inventory[key] = "file"
+        else:
+            inventory[key] = "missing"
+    backup.mkdir(parents=True, exist_ok=True)
+    (backup / "inventory.json").write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return backup, inventory
+
+
+def restore_reinstall_backup(root: Path, backup: Path, inventory: dict[str, str]) -> None:
+    files = backup / "files"
+    for relative in sorted(inventory, key=lambda value: len(Path(value).parts), reverse=True):
+        remove_path(root / relative)
+    for relative, kind in inventory.items():
+        if kind == "missing":
+            continue
+        source = files / relative
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if kind == "directory":
+            shutil.copytree(source, target)
+        else:
+            shutil.copy2(source, target)
+
+
 def config_path() -> Path:
     return Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "agent-kit" / "framework.toml"
+
+
+def shell_profile_path(*, home: Path | None = None, shell: str | None = None) -> Path | None:
+    base = home or Path.home()
+    shell_name = Path(shell or os.environ.get("SHELL", "")).name
+    if shell_name == "zsh":
+        return base / ".zshrc"
+    if shell_name == "bash":
+        return base / ".bash_profile"
+    return None
+
+
+def ensure_agent_kit_shell_path(
+    *,
+    home: Path | None = None,
+    shell: str | None = None,
+    interactive: bool | None = None,
+) -> tuple[str, str | None]:
+    """Offer one init-only, project-independent PATH bootstrap."""
+    profile = shell_profile_path(home=home, shell=shell)
+    if profile is None:
+        return "unsupported", Path(shell or os.environ.get("SHELL", "unknown")).name
+    try:
+        text = profile.read_text(encoding="utf-8") if profile.is_file() else ""
+    except (OSError, UnicodeError) as error:
+        return "error", str(error)
+    binary_dir = str(FRAMEWORK / "bin")
+    if any(
+        binary_dir in line
+        and line.strip().startswith(("export PATH=", "PATH="))
+        and not line.lstrip().startswith("#")
+        for line in text.splitlines()
+    ):
+        return "preserved", str(profile)
+    starts = text.count(SHELL_PATH_MARKER_START)
+    ends = text.count(SHELL_PATH_MARKER_END)
+    if starts or ends:
+        return "invalid", f"malformed or stale managed markers in {profile}"
+    is_interactive = sys.stdin.isatty() if interactive is None else interactive
+    if not is_interactive:
+        return "skipped", "non-interactive init"
+    answer = input(f"Adicionar agent-kit ao PATH em {profile}? [y/N]: ").strip().lower()
+    if answer not in {"y", "yes", "s", "sim"}:
+        return "declined", str(profile)
+    block = "\n".join((
+        SHELL_PATH_MARKER_START,
+        f"export PATH={shlex.quote(binary_dir)}:$PATH",
+        SHELL_PATH_MARKER_END,
+    ))
+    prefix = "" if not text or text.endswith("\n") else "\n"
+    try:
+        profile.parent.mkdir(parents=True, exist_ok=True)
+        with profile.open("a", encoding="utf-8") as stream:
+            stream.write(prefix + block + "\n")
+    except OSError as error:
+        return "error", str(error)
+    return "added", str(profile)
+
+
+def open_tasks(root: Path, features_root: Path, feature: str | None, statuses: set[str]) -> list[dict]:
+    if feature:
+        if not activity_runtime.SAFE_ID.fullmatch(feature):
+            fail(f"invalid feature id: {feature}")
+        directories = [features_root / feature]
+        if not directories[0].is_dir():
+            fail(f"feature not found: {feature}")
+    else:
+        directories = sorted(path for path in features_root.glob("*") if path.is_dir()) if features_root.is_dir() else []
+    rows: list[dict] = []
+    for directory in directories:
+        state_path = directory / "state.json"
+        if not state_path.is_file():
+            continue
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            fail(f"invalid state file {state_path}: {error}")
+        errors = activity_runtime.routing.state_tool.validate_state(state, expected_feature=directory.name)
+        if errors:
+            fail(f"invalid state file {state_path}: " + "; ".join(errors))
+        titles: dict[str, str] = {}
+        tasks_path = directory / "tasks.md"
+        if tasks_path.is_file():
+            try:
+                titles = {
+                    match.group(1): match.group(2).strip()
+                    for match in activity_runtime.routing.TASK_HEADER.finditer(tasks_path.read_text(encoding="utf-8"))
+                }
+            except (OSError, UnicodeError) as error:
+                fail(f"cannot read task definitions {tasks_path}: {error}")
+        for task_id, raw_task in sorted(state.get("tasks", {}).items()):
+            task = raw_task if isinstance(raw_task, dict) else {"status": raw_task}
+            status = task.get("status")
+            if status not in statuses:
+                continue
+            rows.append({
+                "feature": directory.name,
+                "task": task_id,
+                "title": titles.get(task_id),
+                "status": status,
+                "complexity": task.get("complexity"),
+                "risk": task.get("risk"),
+                "modelClass": task.get("modelClass"),
+                "blockReason": task.get("blockReason"),
+                "current": state.get("currentTask") == task_id,
+            })
+    return rows
 
 
 def command_init(args: argparse.Namespace) -> None:
     root = Path(args.root).resolve()
     if not root.is_dir():
         fail(f"not a repository directory: {root}")
-    profile_path(args.profile)
-    harnesses = args.harness or ["codex", "opencode"]
-    write_manifest(root, args.profile, harnesses)
-    data = parse_manifest(root)
-    copy_assets(root, args.profile)
-    changed = sync_agents(root, backup=True)
-    commands = sync_opencode_commands(root, data, backup=True)
+    existing: dict | None = None
+    manifest_was_valid = False
+    if manifest_path(root).is_file():
+        try:
+            existing = parse_manifest(root)
+            manifest_was_valid = True
+        except SystemExit:
+            if not args.force or args.profile is None:
+                raise
+    profile = args.profile or (existing.get("profile") if existing else None)
+    if not isinstance(profile, str):
+        fail("init requires --profile when no valid manifest exists")
+    profile_path(profile)
+    if args.force and not manifest_was_valid and not args.harness:
+        fail("init --force requires at least one --harness when no valid manifest exists")
+    harnesses = args.harness or (list(existing["harnesses"]) if existing else ["codex", "opencode"])
+    staged_catalog: dict | None = None
+    staged_catalog_status = "refreshed"
+    staged_orchestrator: str | None = None
+    if args.force:
+        configured_orchestrator = (
+            existing.get("orchestrator_model")
+            if existing is not None and not args.harness and args.orchestrator_model is None
+            else None
+        )
+        staged_catalog, staged_catalog_status, staged_orchestrator = preflight_reinstall_catalog(
+            root, profile, harnesses, args, configured_orchestrator,
+        )
+    backup: Path | None = None
+    inventory: dict[str, str] = {}
+    if args.force:
+        affected = reinstall_paths(root, sorted(set((*harnesses, *((existing or {}).get("harnesses", []))))))
+        print("INIT_FORCE_PATHS:")
+        for path in affected:
+            print(f"- {path.relative_to(root)}")
+        if not args.yes:
+            if not sys.stdin.isatty():
+                fail("init --force requires --yes in non-interactive mode")
+            if input("Reinstall framework-owned configuration? [y/N]: ").strip().lower() not in {"y", "yes"}:
+                fail("init --force cancelled")
+        backup, inventory = create_reinstall_backup(root, affected)
+        print(f"REINSTALL_BACKUP: {backup.relative_to(root)}")
+    try:
+        write_manifest(
+            root, profile, harnesses, force=args.force,
+            orchestrator_model=staged_orchestrator or args.orchestrator_model,
+        )
+        data = parse_manifest(root)
+        copy_assets(root, profile, force=args.force)
+        changed = sync_agents(root, backup=True, force=args.force)
+        adapters = sync_harness_adapters(root, data, replace_managed=args.force)
+        removed_adapters = prune_obsolete_managed_adapters(root, data) if args.force else []
+        commands = sync_opencode_commands(root, data, backup=True, force=args.force)
+        if staged_catalog is not None:
+            model_catalog.write_catalog(root, staged_catalog)
+            catalog_status, catalog = staged_catalog_status, staged_catalog
+        else:
+            catalog_status, catalog = ensure_model_catalog(root, data, args, force=args.force)
+        orchestrator_model = select_orchestrator_model(
+            root, data, catalog, staged_orchestrator or args.orchestrator_model,
+        )
+        persist_orchestrator_model(root, orchestrator_model)
+        data = parse_manifest(root)
+        aligned_adapters = sync_harness_adapters(root, data, replace_managed=args.force)
+        adapters = sorted(set((*adapters, *aligned_adapters)))
+        memory_status, memory_detail = ensure_ai_memory_config(root, data, args)
+        print(f"MODEL_CATALOG: {catalog_status} ({catalog['fingerprint'][:12]})")
+        print(f"ORCHESTRATOR_MODEL: {orchestrator_model}")
+        print(f"AI_MEMORY: {memory_status}" + (f" ({memory_detail})" if memory_detail else ""))
+        if args.force:
+            command_doctor(args)
+    except BaseException:
+        if backup is not None:
+            restore_reinstall_backup(root, backup, inventory)
+            print(f"INIT_FORCE_ROLLBACK: {backup.relative_to(root)}", file=sys.stderr)
+        raise
     print(f"INIT: {root}")
-    print(f"PROFILE: {args.profile}")
+    print(f"PROFILE: {profile}")
     print(f"AGENTS: {'updated' if changed else 'unchanged'}")
+    print(f"HARNESS_ADAPTERS: {len(adapters)} updated")
+    if args.force:
+        print(f"OBSOLETE_ADAPTERS: {len(removed_adapters)} removed")
     print(f"OPENCODE_COMMANDS: {','.join(commands) if commands else 'unchanged'}")
+    if args.force:
+        print("INIT_FORCE: complete")
+    shell_status, shell_detail = ensure_agent_kit_shell_path()
+    print(f"SHELL_PATH: {shell_status}" + (f" ({shell_detail})" if shell_detail else ""))
 
 
 def command_sync(args: argparse.Namespace) -> None:
@@ -335,9 +1332,21 @@ def command_sync(args: argparse.Namespace) -> None:
     data = parse_manifest(root)
     copy_assets(root, data["profile"])
     changed = sync_agents(root, backup=False)
+    adapters = sync_harness_adapters(root, data, replace_managed=args.replace_managed)
     commands = sync_opencode_commands(root, data, backup=False)
+    catalog_status, catalog = ensure_model_catalog(root, data, args)
+    orchestrator_model = select_orchestrator_model(root, data, catalog, None)
+    persist_orchestrator_model(root, orchestrator_model)
+    data = parse_manifest(root)
+    aligned_adapters = sync_harness_adapters(root, data, replace_managed=args.replace_managed)
+    adapters = sorted(set((*adapters, *aligned_adapters)))
+    memory_status, memory_detail = ensure_ai_memory_config(root, data, args)
     print(f"SYNC: {root}")
+    print(f"MODEL_CATALOG: {catalog_status} ({catalog['fingerprint'][:12]})")
+    print(f"ORCHESTRATOR_MODEL: {orchestrator_model}")
+    print(f"AI_MEMORY: {memory_status}" + (f" ({memory_detail})" if memory_detail else ""))
     print(f"AGENTS: {'updated' if changed else 'unchanged'}")
+    print(f"HARNESS_ADAPTERS: {len(adapters)} updated")
     print(f"OPENCODE_COMMANDS: {','.join(commands) if commands else 'unchanged'}")
 
 
@@ -362,27 +1371,66 @@ def command_doctor(args: argparse.Namespace) -> None:
             errors.append(f"managed profile missing: {profile}")
         if not (managed / "skills" / "engineering-protocol" / "SKILL.md").is_file():
             errors.append("shared engineering-protocol missing")
+        for name in ("README.md", "schema.json", "state.py", "validate_state.py"):
+            if not (managed / "state" / name).is_file():
+                errors.append(f"portable state asset missing: {name}")
         for workflow in WORKFLOWS:
             available = (managed / "workflows" / f"{workflow}.md").is_file()
             print(f"WORKFLOW {workflow}: {'ready' if available else 'missing'}")
             if not available:
                 errors.append(f"shared workflow missing: {workflow}")
+    state_settings = data.get("state", {})
+    state_provider = state_settings.get("provider", "framework") if isinstance(state_settings, dict) else "framework"
+    state_path = state_settings.get("path", ".specs/features") if isinstance(state_settings, dict) else ".specs/features"
+    if state_provider == "project":
+        command = state_settings.get("command") if isinstance(state_settings, dict) else None
+        print(f"STATE: project-owned ({command or 'project routing'})")
+    else:
+        print(f"STATE: framework-ready ({state_path})")
     agents = root / "AGENTS.md"
     text = agents.read_text(encoding="utf-8") if agents.is_file() else ""
     if text.count(MARKER_START) != 1 or text.count(MARKER_END) != 1:
         errors.append("AGENTS.md managed block missing or malformed")
-    memory = root / ".ai-memory.toml"
-    if not memory.is_file():
-        warnings.append(".ai-memory.toml missing; ai-memory unavailable")
+    memory = root / AI_MEMORY_FILE
+    if data.get("ai_memory", True) is False:
+        print("AI_MEMORY: disabled")
     else:
-        memory_text = memory.read_text(encoding="utf-8")
-        if "drop_subagent_captures" not in memory_text:
-            warnings.append("ai-memory does not declare drop_subagent_captures")
+        memory_errors, memory_warnings = ai_memory_validation(memory)
+        errors.extend(memory_errors)
+        warnings.extend(memory_warnings)
+        print(f"AI_MEMORY: {'invalid' if memory_errors else 'preserved'}")
+    try:
+        catalog = model_catalog.load_catalog(root)
+        catalog_errors = model_catalog.validate_catalog(catalog, data["harnesses"])
+    except ValueError as error:
+        catalog = None
+        catalog_errors = [str(error)]
+    errors.extend(catalog_errors)
+    print(f"MODEL_CATALOG: {'invalid' if catalog_errors else catalog['fingerprint'][:12]}")
+    if catalog is not None and not catalog_errors:
+        try:
+            orchestrator_model = select_orchestrator_model(root, data, catalog, None)
+            print(f"ORCHESTRATOR_MODEL: {orchestrator_model}")
+        except SystemExit:
+            errors.append("ORCHESTRATOR_UNAVAILABLE")
     for harness in data["harnesses"]:
         adapter = managed / "harness" / f"{harness}.md"
         print(f"HARNESS {harness}: {'adapter-ready' if adapter.is_file() else 'missing-adapter'}")
-        if shutil.which(harness) is None:
-            warnings.append(f"{harness} executable not found in PATH")
+        providers = configured_providers(root, harness)
+        print(f"PROVIDERS {harness}: {', '.join(providers) if providers else 'none-configured'}")
+        if shutil.which(HARNESS_EXECUTABLES[harness]) is None:
+            warnings.append(f"{HARNESS_EXECUTABLES[harness]} executable not found in PATH")
+        if data.get("harness", {}).get("managed_adapters", True):
+            expected_files = harness_templates(
+                harness,
+                profile=profile,
+                orchestrator_model=data.get("orchestrator_model") if harness == data["harnesses"][0] else None,
+            )
+            for relative, content in expected_files.items():
+                target = root / HARNESS_DIRS[harness] / relative
+                actual = target.read_text(encoding="utf-8") if target.is_file() else ""
+                if actual != content:
+                    errors.append(f"{harness} adapter missing or stale: {target.relative_to(root)}")
         if harness == "opencode":
             for workflow in WORKFLOWS:
                 command = root / ".opencode" / "commands" / f"{workflow}.md"
@@ -429,6 +1477,200 @@ def command_status(args: argparse.Namespace) -> None:
     print(f"REGISTRY: {'present' if registry.is_file() else 'missing'}")
 
 
+def command_catalog(args: argparse.Namespace) -> None:
+    root = Path(args.root).resolve()
+    data = parse_manifest(root)
+    if args.catalog_command == "refresh":
+        try:
+            value = model_catalog.refresh(
+                root, args.harness or data["harnesses"],
+                discover=not args.configured_only, merge=bool(args.harness),
+            )
+        except ValueError as error:
+            fail(str(error))
+        selected = select_orchestrator_model(root, data, value, args.orchestrator_model)
+        persist_orchestrator_model(root, selected)
+        data = parse_manifest(root)
+        sync_harness_adapters(root, data, replace_managed=False)
+    else:
+        try:
+            value = model_catalog.load_catalog(root)
+        except ValueError as error:
+            fail(str(error))
+    print(json.dumps(value, indent=2, sort_keys=True))
+
+
+def print_model_proposal(proposal: dict) -> None:
+    print(f"MODEL_PROPOSAL: {proposal['proposalId']} harness={proposal['harness']} provider={proposal['provider']}")
+    print("ROLE\tRECOMMENDED\tPROVIDER\tEFFORT\tESTIMATE\tFLOOR")
+    for role in proposal["roles"]:
+        recommended = role["recommended"]
+        estimate = recommended["estimate"]
+        tokens = estimate.get("tokens")
+        cost = estimate.get("costMicrounits")
+        rendered = f"{tokens} tokens" if tokens is not None else "unknown tokens"
+        if cost is not None:
+            rendered += f"/{cost} microunits"
+        print("\t".join((role["role"], recommended["model"], str(recommended["provider"]), recommended["reasoningEffort"], rendered, role["floor"])))
+        for alternative in role["alternatives"]:
+            state = "eligible" if alternative["eligible"] else f"disabled: {alternative['disabledReason']}"
+            print(f"  - {alternative['model']} [{alternative['provider']}] {state}")
+    print(f"APPROVE: agent-kit {proposal['workflow']} --approve {proposal['proposalId']}")
+
+
+def interactive_model_approval(proposal: dict) -> list[str] | None:
+    while True:
+        print("ACTIONS: 1=approve 2=change-models 3=show-justification 4=cancel")
+        choice = input("Select action [1]: ").strip() or "1"
+        if choice == "1":
+            return []
+        if choice == "2":
+            overrides: list[str] = []
+            for contract in proposal["roles"]:
+                if contract.get("locked"):
+                    continue
+                eligible = [value for value in contract["alternatives"] if value.get("eligible")]
+                print(f"{contract['role']} models:")
+                for index, candidate in enumerate(eligible, 1):
+                    marker = " (recommended)" if candidate["model"] == contract["recommended"]["model"] else ""
+                    print(f"  {index}. {candidate['model']} [{candidate['provider']}]{marker}")
+                selected = input(f"Select {contract['role']} [recommended]: ").strip()
+                if not selected:
+                    continue
+                if not selected.isdigit() or not 1 <= int(selected) <= len(eligible):
+                    print("Invalid selection; no dispatch plan created.")
+                    return None
+                overrides.append(f"{contract['role']}={eligible[int(selected) - 1]['model']}")
+            return overrides
+        if choice == "3":
+            for contract in proposal["roles"]:
+                print(f"- {contract['role']}: {contract['justification']}")
+            continue
+        if choice == "4":
+            return None
+        print("Invalid action.")
+
+
+def command_activity(args: argparse.Namespace) -> None:
+    root = Path(args.root).resolve()
+    data = parse_manifest(root)
+    os.environ["AGENT_FRAMEWORK_CONSUMER_ROOT"] = str(root)
+    try:
+        if args.approve:
+            value = activity_runtime.approve_proposal(root, args.approve, args.model)
+        else:
+            if not args.target:
+                fail(f"{args.command} requires a task, feature, or intent when creating a proposal")
+            proposal = activity_runtime.create_proposal(
+                root, data, args.command, args.target, args.provider, args.harness,
+            )
+            if args.propose:
+                value = proposal
+            elif args.yes:
+                value = activity_runtime.approve_proposal(root, proposal["proposalId"], args.model)
+            elif not sys.stdin.isatty():
+                fail(f"INTERACTION_REQUIRED: inspect proposal {proposal['proposalId']} and approve it explicitly")
+            else:
+                print_model_proposal(proposal)
+                selections = interactive_model_approval(proposal)
+                if selections is None:
+                    fail("activity cancelled; proposal remains available for explicit approval")
+                value = activity_runtime.approve_proposal(root, proposal["proposalId"], [*args.model, *selections])
+    except ValueError as error:
+        fail(str(error))
+    if args.json:
+        print(json.dumps(value, indent=2, sort_keys=True))
+    elif value.get("kind") == "ModelProposal":
+        print_model_proposal(value)
+    else:
+        print(f"DISPATCH_PLAN: {value['planId']} APPROVED")
+
+
+def command_dispatch(args: argparse.Namespace) -> None:
+    root = Path(args.root).resolve()
+    os.environ["AGENT_FRAMEWORK_CONSUMER_ROOT"] = str(root)
+    try:
+        if args.dispatch_command == "next-fallback":
+            value = activity_runtime.next_fallback(root, args.plan, args.role, args.failed_model)
+        else:
+            value = activity_runtime.record_receipt(
+                root, args.plan, args.role, args.result, args.effective_model,
+                args.input_tokens, args.output_tokens, args.cost_microunits,
+                args.cache_tokens, args.gate,
+            )
+    except ValueError as error:
+        fail(str(error))
+    if args.json:
+        print(json.dumps(value, indent=2, sort_keys=True))
+    elif args.dispatch_command == "next-fallback":
+        print(f"APPROVED_FALLBACK: {value['model']} provider={value['provider']} agent={value['agent']}")
+    else:
+        print(f"DISPATCH_RECEIPT: {args.plan} {args.role} {args.result}")
+
+
+def command_usage(args: argparse.Namespace) -> None:
+    value = activity_runtime.usage_report(Path(args.root).resolve())
+    if args.json:
+        print(json.dumps(value, indent=2, sort_keys=True))
+        return
+    print(f"USAGE: {sum(item['runs'] for item in value['models'].values())} run(s); costUnknown={str(value['costUnknown']).lower()}")
+    for model, totals in sorted(value["models"].items()):
+        print(f"- {model}: runs={totals['runs']} input={totals['inputTokens']} output={totals['outputTokens']} cache={totals['cacheTokens']} costMicrounits={totals['costMicrounits']}")
+
+
+def command_tasks(args: argparse.Namespace) -> None:
+    root = Path(args.root).resolve()
+    data = parse_manifest(root)
+    state_settings = data.get("state", {}) if isinstance(data.get("state", {}), dict) else {}
+    relative_state_path = Path(str(state_settings.get("path", ".specs/features")))
+    if relative_state_path.is_absolute() or ".." in relative_state_path.parts:
+        fail("state.path must stay inside the project")
+    features_root = root / relative_state_path
+    if args.status:
+        statuses = set(args.status)
+    elif args.all:
+        statuses = set(activity_runtime.routing.state_tool.TASK_STATUSES)
+        statuses.update(activity_runtime.routing.state_tool.LEGACY_TASK_STATUSES)
+    else:
+        statuses = set(OPEN_TASK_STATUSES)
+    rows = open_tasks(root, features_root, args.feature, statuses)
+    if args.json:
+        print(json.dumps({
+            "schemaVersion": 1,
+            "kind": "TaskList",
+            "feature": args.feature,
+            "statePath": relative_state_path.as_posix(),
+            "statuses": sorted(statuses),
+            "tasks": rows,
+        }, indent=2, ensure_ascii=False, sort_keys=True))
+        return
+    print(f"OPEN_TASKS: {len(rows)}")
+    if not rows:
+        return
+    print("FEATURE\tTASK\tSTATUS\tCOMPLEXITY\tRISK\tTITLE")
+    for row in rows:
+        current = "*" if row["current"] else ""
+        print("\t".join((
+            row["feature"], row["task"] + current, str(row["status"]),
+            str(row["complexity"] or "-"), str(row["risk"] or "-"),
+            str(row["title"] or "-"),
+        )))
+
+
+def command_route(args: argparse.Namespace) -> None:
+    root = Path(args.root).resolve()
+    data = parse_manifest(root)
+    os.environ["AGENT_FRAMEWORK_CONSUMER_ROOT"] = str(root)
+    try:
+        value = activity_runtime.create_proposal(root, data, args.workflow, args.target, args.provider, args.harness)
+    except ValueError as error:
+        fail(str(error))
+    if args.json or args.route_command == "simulate":
+        print(json.dumps(value, indent=2, sort_keys=True))
+    else:
+        print_model_proposal(value)
+
+
 def command_diff(args: argparse.Namespace) -> None:
     root = Path(args.root).resolve()
     data = parse_manifest(root)
@@ -438,12 +1680,40 @@ def command_diff(args: argparse.Namespace) -> None:
     print(f"MANAGED_ASSETS: {'change' if current != expected else 'unchanged'}")
     agents = (root / "AGENTS.md").read_text(encoding="utf-8") if (root / "AGENTS.md").is_file() else ""
     print(f"AGENTS_BLOCK: {'present' if agents.count(MARKER_START) == agents.count(MARKER_END) == 1 else 'change'}")
+    if data.get("ai_memory", True) is False:
+        print("AI_MEMORY: disabled")
+    elif not (root / AI_MEMORY_FILE).is_file():
+        print("AI_MEMORY: create")
+    else:
+        memory_errors, _memory_warnings = ai_memory_validation(root / AI_MEMORY_FILE)
+        print(f"AI_MEMORY: {'invalid' if memory_errors else 'preserve'}")
+    try:
+        catalog = model_catalog.load_catalog(root)
+        catalog_errors = model_catalog.validate_catalog(catalog, data["harnesses"])
+        print(f"MODEL_CATALOG: {'invalid' if catalog_errors else 'preserve'}")
+    except ValueError:
+        print("MODEL_CATALOG: create")
     if "opencode" in data["harnesses"]:
         for workflow in WORKFLOWS:
             target = root / ".opencode" / "commands" / f"{workflow}.md"
             current = target.read_text(encoding="utf-8") if target.is_file() else ""
             expected = managed_command(workflow, WORKFLOWS[workflow], project_workflow_hook(data, workflow))
             print(f"OPENCODE_COMMAND /{workflow}: {'unchanged' if current == expected else 'change'}")
+    if data.get("harness", {}).get("managed_adapters", True):
+        for harness in data["harnesses"]:
+            changes = sum(
+                1
+                for relative, content in harness_templates(
+                    harness,
+                    profile=data["profile"],
+                    orchestrator_model=data.get("orchestrator_model") if harness == data["harnesses"][0] else None,
+                ).items()
+                if not (root / HARNESS_DIRS[harness] / relative).is_file()
+                or (root / HARNESS_DIRS[harness] / relative).read_text(encoding="utf-8") != content
+            )
+            print(f"{harness.upper()}_ADAPTERS: {'change' if changes else 'unchanged'}")
+    else:
+        print("HARNESS_ADAPTERS: project override")
 
 
 def main() -> None:
@@ -451,10 +1721,21 @@ def main() -> None:
     parser.add_argument("--root", default=".", help="consumer repository")
     sub = parser.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init")
-    init.add_argument("--profile", required=True)
-    init.add_argument("--harness", action="append", choices=("codex", "opencode"))
+    init.add_argument("--profile")
+    init.add_argument("--harness", action="append", choices=SUPPORTED_HARNESSES)
+    init.add_argument("--force", action="store_true", help="back up and reinstall framework-owned project configuration")
+    init.add_argument("--yes", action="store_true", help="approve a non-interactive forced reinstall")
+    init.add_argument("--reuse-model-lock", action="store_true", help="reuse an existing valid model catalog lock")
+    init.add_argument("--discover-models", action="store_true")
+    init.add_argument("--orchestrator-model")
+    init.add_argument("--memory-workspace")
+    init.add_argument("--memory-project")
     init.set_defaults(func=command_init)
     sync = sub.add_parser("sync")
+    sync.add_argument("--replace-managed", action="store_true", help="back up and restore modified framework-owned harness adapters")
+    sync.add_argument("--memory-workspace")
+    sync.add_argument("--memory-project")
+    sync.add_argument("--refresh-models", action="store_true")
     sync.set_defaults(func=command_sync)
     doctor = sub.add_parser("doctor")
     doctor.set_defaults(func=command_doctor)
@@ -462,8 +1743,73 @@ def main() -> None:
     install.set_defaults(func=command_install)
     status = sub.add_parser("status")
     status.set_defaults(func=command_status)
+    catalog = sub.add_parser("catalog")
+    catalog_sub = catalog.add_subparsers(dest="catalog_command", required=True)
+    catalog_refresh = catalog_sub.add_parser("refresh")
+    catalog_refresh.add_argument("--harness", action="append", choices=SUPPORTED_HARNESSES)
+    catalog_refresh.add_argument("--configured-only", action="store_true")
+    catalog_refresh.add_argument("--orchestrator-model")
+    catalog_sub.add_parser("show")
+    catalog.set_defaults(func=command_catalog)
     diff = sub.add_parser("diff")
     diff.set_defaults(func=command_diff)
+    for workflow in WORKFLOWS:
+        activity = sub.add_parser(workflow)
+        activity.add_argument("target", nargs="?")
+        activity.add_argument("--provider", choices=("auto", "openai", "opencode", "openrouter", "copilot", "claude"), default="auto")
+        activity.add_argument("--harness", choices=SUPPORTED_HARNESSES)
+        activity.add_argument("--propose", action="store_true")
+        activity.add_argument("--approve")
+        activity.add_argument("--model", action="append", default=[])
+        activity.add_argument("--yes", action="store_true")
+        activity.add_argument("--json", action="store_true")
+        activity.set_defaults(func=command_activity)
+    dispatch = sub.add_parser("dispatch")
+    dispatch_sub = dispatch.add_subparsers(dest="dispatch_command", required=True)
+    dispatch_record = dispatch_sub.add_parser("record")
+    dispatch_record.add_argument("--plan", required=True)
+    dispatch_record.add_argument("--role", choices=activity_runtime.ROLE_ORDER, required=True)
+    dispatch_record.add_argument("--result", choices=tuple(sorted(activity_runtime.SAFE_RESULT)), required=True)
+    dispatch_record.add_argument("--effective-model", required=True)
+    dispatch_record.add_argument("--input-tokens", type=int)
+    dispatch_record.add_argument("--output-tokens", type=int)
+    dispatch_record.add_argument("--cache-tokens", type=int)
+    dispatch_record.add_argument("--cost-microunits", type=int)
+    dispatch_record.add_argument("--gate", action="append", default=[])
+    dispatch_record.add_argument("--json", action="store_true")
+    dispatch_fallback = dispatch_sub.add_parser("next-fallback")
+    dispatch_fallback.add_argument("--plan", required=True)
+    dispatch_fallback.add_argument("--role", choices=activity_runtime.ROLE_ORDER, required=True)
+    dispatch_fallback.add_argument("--failed-model", required=True)
+    dispatch_fallback.add_argument("--json", action="store_true")
+    dispatch.set_defaults(func=command_dispatch)
+    usage = sub.add_parser("usage")
+    usage_sub = usage.add_subparsers(dest="usage_command", required=True)
+    usage_report = usage_sub.add_parser("report")
+    usage_report.add_argument("--json", action="store_true")
+    usage.set_defaults(func=command_usage)
+    tasks = sub.add_parser("tasks")
+    tasks_sub = tasks.add_subparsers(dest="tasks_command", required=True)
+    tasks_list = tasks_sub.add_parser("list")
+    tasks_list.add_argument("--feature")
+    task_filters = tasks_list.add_mutually_exclusive_group()
+    task_filters.add_argument(
+        "--status", action="append",
+        choices=tuple(sorted(activity_runtime.routing.state_tool.TASK_STATUSES | activity_runtime.routing.state_tool.LEGACY_TASK_STATUSES)),
+    )
+    task_filters.add_argument("--all", action="store_true")
+    tasks_list.add_argument("--json", action="store_true")
+    tasks.set_defaults(func=command_tasks)
+    route = sub.add_parser("route")
+    route_sub = route.add_subparsers(dest="route_command", required=True)
+    for route_name in ("explain", "simulate"):
+        route_parser = route_sub.add_parser(route_name)
+        route_parser.add_argument("target")
+        route_parser.add_argument("--workflow", choices=tuple(WORKFLOWS), default="continue")
+        route_parser.add_argument("--provider", choices=("auto", "openai", "opencode", "openrouter", "copilot", "claude"), default="auto")
+        route_parser.add_argument("--harness", choices=SUPPORTED_HARNESSES)
+        route_parser.add_argument("--json", action="store_true")
+    route.set_defaults(func=command_route)
     version = sub.add_parser("version")
     version.set_defaults(func=lambda _: print(VERSION))
     args = parser.parse_args()

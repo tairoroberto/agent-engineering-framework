@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-engineering-framework.local/schemas/portable-feature-state-v2.json",
+  "title": "Portable feature state v2",
+  "type": "object",
+  "required": ["schemaVersion", "revision", "feature", "created", "updated", "phase", "currentTask", "reviewIteration", "lastHarness", "lastAgent", "lastModel", "lastResult", "blocker", "attempts", "tasks", "readyTasks", "runningTasks", "blockedTasks", "parallelTasks", "executionPolicy", "gates", "handoff", "metrics"],
+  "properties": {
+    "schemaVersion": {"const": 2},
+    "revision": {"type": "integer", "minimum": 0},
+    "feature": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"},
+    "created": {"type": "string", "minLength": 1},
+    "updated": {"type": "string", "minLength": 1},
+    "phase": {"enum": ["specify", "design", "tasks", "ready", "implementing", "gates", "reviewing", "fixing", "qa", "final_validation", "ready_for_pr", "blocked", "human_escalation"]},
+    "currentTask": {"type": ["string", "null"]},
+    "tasks": {"type": "object"},
+    "gates": {"type": "object", "additionalProperties": {"type": "object", "required": ["result", "command", "evidence", "at"], "properties": {"result": {"enum": ["PASS", "FAIL", "SKIP", "EXTERNAL"]}, "command": {"type": "string"}, "evidence": {"type": "string"}, "at": {"type": "string"}}}},
+    "handoff": {"type": ["object", "null"]},
+    "lastHarness": {"enum": ["opencode", "codex", "copilot", "claude", "human", null]},
+    "lastAgent": {"type": ["string", "null"]},
+    "lastModel": {"type": ["string", "null"]},
+    "lastResult": {"type": ["string", "null"]},
+    "blocker": {"type": ["string", "object", "null"]}
+  },
+  "additionalProperties": false
+}

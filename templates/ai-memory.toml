@@ -1,0 +1,21 @@
+workspace = "<workspace>"
+project = "<project>"
+
+drop_subagent_captures = "true"
+
+[briefing]
+inject_on_session_start = "true"
+max_chars = 3000
+
+[capture]
+ignore_paths = [
+    ".env",
+    ".env.*",
+    "local.properties",
+    "**/secrets/**",
+    "**/*.pem",
+    "**/*.key",
+    "**/*.p12",
+    "**/*.jks",
+    "**/*.keystore"
+]

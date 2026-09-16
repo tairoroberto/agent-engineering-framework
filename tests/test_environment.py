@@ -179,6 +179,21 @@ class EnvironmentRuntimeTest(unittest.TestCase):
         self.assertEqual(("ai-memory:install",), tuple(action.id for action in result.actions))
         self.assertEqual("aarch64", environment.architecture_artifact("arm64"))
         self.assertEqual("x86_64", environment.architecture_artifact("x86_64"))
+
+    def test_missing_ai_memory_outside_macos_reports_detection_only(self) -> None:
+        context = environment.EnvironmentContext(
+            root=Path("/workspace"), home=Path("/home/tester"), runner=FakeRunner({}),
+            system="Linux", architecture="x86_64", executable_finder=lambda _name: None,
+        )
+
+        result = environment.AiMemoryRequirement(()).diagnose(
+            context, environment.PlatformInfo("Linux", "x86_64"),
+        )
+
+        automatic = next(check for check in result.checks if check.id == "automatic-install")
+        self.assertEqual(environment.RequirementStatus.UNSUPPORTED, automatic.status)
+        self.assertFalse(automatic.required)
+        self.assertEqual((), result.actions)
         self.assertIsNone(environment.architecture_artifact("ppc64"))
 
     def test_ai_memory_running_with_http_405_and_integrations_is_healthy(self) -> None:
@@ -191,7 +206,8 @@ class EnvironmentRuntimeTest(unittest.TestCase):
             (data / "config.toml").write_text("ready = true\n", encoding="utf-8")
             codex = home / ".codex"
             codex.mkdir()
-            (codex / "config.toml").write_text("[mcp_servers.ai-memory]\n[hooks.ai-memory]\n", encoding="utf-8")
+            (codex / "config.toml").write_text("[mcp_servers.ai-memory]\n", encoding="utf-8")
+            (codex / "hooks.json").write_text('{"hooks": [{"command": "ai-memory", "args": ["hook"]}]}\n', encoding="utf-8")
             opencode = home / ".config" / "opencode" / "plugins"
             opencode.mkdir(parents=True)
             (opencode.parent / "opencode.json").write_text('{"mcp":{"ai-memory":{}}}\n', encoding="utf-8")
@@ -225,6 +241,53 @@ class EnvironmentRuntimeTest(unittest.TestCase):
             self.assertEqual("HTTP 405", next(check.detail for check in result.checks if check.id == "http"))
             self.assertEqual(environment.RequirementStatus.UNSUPPORTED, next(check.status for check in result.checks if check.id == "copilot-hooks"))
             self.assertFalse(result.actions)
+
+    def test_codex_hooks_require_the_dedicated_hooks_file(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw)
+            codex = home / ".codex"
+            codex.mkdir()
+            (codex / "config.toml").write_text(
+                "[mcp_servers.ai-memory]\n[hooks.other]\ncommand = 'other-hook'\n",
+                encoding="utf-8",
+            )
+            context = environment.EnvironmentContext(
+                root=home, home=home, runner=FakeRunner({}), system="Darwin", architecture="arm64",
+                executable_finder=lambda _name: None,
+            )
+
+            missing = environment.AiMemoryRequirement(())._harness_checks(context, "codex")
+            self.assertEqual(environment.RequirementStatus.OK, missing[0].status)
+            self.assertEqual(environment.RequirementStatus.MISSING, missing[1].status)
+
+            (codex / "hooks.json").write_text(
+                '{"hooks": [{"command": "ai-memory", "args": ["hook"]}]}\n',
+                encoding="utf-8",
+            )
+            configured = environment.AiMemoryRequirement(())._harness_checks(context, "codex")
+            self.assertEqual(environment.RequirementStatus.OK, configured[1].status)
+
+    def test_opencode_and_copilot_mcp_require_a_structured_server_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            root = Path(raw) / "project"
+            opencode = home / ".config" / "opencode"
+            opencode.mkdir(parents=True)
+            root.mkdir()
+            (opencode / "opencode.json").write_text('{"label": "ai-memory"}\n', encoding="utf-8")
+            vscode = root / ".vscode"
+            vscode.mkdir()
+            (vscode / "mcp.json").write_text('{"label": "ai-memory"}\n', encoding="utf-8")
+            context = environment.EnvironmentContext(
+                root=root, home=home, runner=FakeRunner({}), system="Darwin", architecture="arm64",
+                executable_finder=lambda _name: None,
+            )
+
+            opencode_checks = environment.AiMemoryRequirement(())._harness_checks(context, "opencode")
+            copilot_checks = environment.AiMemoryRequirement(())._harness_checks(context, "copilot")
+
+            self.assertEqual(environment.RequirementStatus.MISSING, opencode_checks[0].status)
+            self.assertEqual(environment.RequirementStatus.MISSING, copilot_checks[0].status)
 
     def test_ai_memory_is_partial_when_launchd_is_loaded_but_http_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -346,6 +409,9 @@ class EnvironmentRuntimeTest(unittest.TestCase):
             skill = home / ".config" / "opencode" / "skills" / "caveman"
             skill.mkdir(parents=True)
             (skill / "SKILL.md").write_text("---\nname: caveman\n---\n", encoding="utf-8")
+            (skill / ".skill-meta.json").write_text(
+                '{"source": "JuliusBrussee/caveman"}\n', encoding="utf-8",
+            )
             context = environment.EnvironmentContext(
                 root=home, home=home, runner=FakeRunner({}), system="Darwin", architecture="arm64",
                 executable_finder=lambda name: {"npx": "/bin/npx", "codex": "/bin/codex"}.get(name),
@@ -355,6 +421,28 @@ class EnvironmentRuntimeTest(unittest.TestCase):
 
             self.assertEqual(environment.RequirementStatus.PARTIAL, result.status)
             self.assertEqual(environment.RequirementStatus.MISSING, next(check.status for check in result.checks if check.id == "codex-link"))
+
+    def test_caveman_filesystem_fallback_without_official_origin_is_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw)
+            skill = home / ".agents" / "skills" / "caveman"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("---\nname: caveman\n---\n", encoding="utf-8")
+            runner = FakeRunner({
+                ("/bin/npx", "--no-install", "skills", "ls", "-g"): environment.CommandResult(
+                    ("/bin/npx", "--no-install", "skills", "ls", "-g"), 0, stdout="other-skill\n",
+                ),
+            })
+            context = environment.EnvironmentContext(
+                root=home, home=home, runner=runner, system="Darwin", architecture="arm64",
+                executable_finder=lambda name: "/bin/npx" if name == "npx" else None,
+            )
+
+            result = environment.CavemanRequirement(()).diagnose(
+                context, environment.PlatformInfo("Darwin", "arm64", node_version="v22", npm_version="10", npx_version="11"),
+            )
+
+            self.assertEqual(environment.RequirementStatus.PARTIAL, result.status)
 
     def test_tlc_skill_with_unverified_origin_is_partial_not_success(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -454,6 +542,10 @@ class EnvironmentRuntimeTest(unittest.TestCase):
 
             def run(argv: tuple[str, ...], *, timeout: float = 10) -> environment.CommandResult:
                 normalized = tuple(argv)
+                if normalized == ("/bin/npx", "--no-install", "skills", "ls", "-g"):
+                    listed = "caveman\n" if (home / ".agents" / "skills" / "caveman").is_dir() else "other-skill\n"
+                    runner.calls.append(normalized)
+                    return environment.CommandResult(normalized, 0, stdout=listed)
                 if normalized == ("/bin/npx", "skills", "add", "JuliusBrussee/caveman", "-g"):
                     skill = home / ".agents" / "skills" / "caveman"
                     skill.mkdir(parents=True)

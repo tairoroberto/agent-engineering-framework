@@ -9,6 +9,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
+import json
 import os
 from pathlib import Path
 import platform as platform_runtime
@@ -111,12 +112,14 @@ class RepairAction:
     id: str
     description: str
     requirement_id: str
+    preview: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, str]:
         return {
             "id": self.id,
             "description": self.description,
             "requirementId": self.requirement_id,
+            "preview": list(self.preview),
         }
 
 
@@ -428,6 +431,26 @@ def safe_file_contains(path: Path, value: str) -> bool:
         return False
 
 
+def json_mcp_server_configured(path: Path, *, top_level_servers: bool = False) -> bool:
+    """Recognize a named MCP server structurally without exposing config values."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    if top_level_servers:
+        servers = data.get("servers")
+        return isinstance(servers, dict) and "ai-memory" in servers
+    mcp = data.get("mcp")
+    if not isinstance(mcp, dict):
+        return False
+    if "ai-memory" in mcp:
+        return True
+    servers = mcp.get("servers")
+    return isinstance(servers, dict) and "ai-memory" in servers
+
+
 class AiMemoryRequirement(EnvironmentRequirement):
     """Diagnose native ai-memory health and supported harness capabilities."""
 
@@ -445,8 +468,9 @@ class AiMemoryRequirement(EnvironmentRequirement):
             checks.append(CheckResult("binary", "binary", RequirementStatus.MISSING, "not found"))
             checks.append(CheckResult("initialized", "initialized", RequirementStatus.MISSING, "binary unavailable"))
             checks.append(CheckResult("service", "service", RequirementStatus.MISSING, "binary unavailable"))
+            checks.append(self._automatic_install_check(platform))
             checks.extend(self._integration_checks(context, available=False))
-            actions = self._missing_actions(platform)
+            actions = self._missing_actions(context, platform)
             return RequirementResult(
                 id=self.id,
                 name=self.name,
@@ -597,8 +621,9 @@ class AiMemoryRequirement(EnvironmentRequirement):
     def _harness_checks(self, context: EnvironmentContext, harness: str) -> tuple[CheckResult, ...]:
         if harness == "codex":
             config = context.home / ".codex" / "config.toml"
+            hooks_config = context.home / ".codex" / "hooks.json"
             mcp = safe_file_contains(config, "[mcp_servers.ai-memory]")
-            hooks = safe_file_contains(config, "ai-memory") and safe_file_contains(config, "hook")
+            hooks = safe_file_contains(hooks_config, "ai-memory") and safe_file_contains(hooks_config, "hook")
             return (
                 CheckResult("codex-mcp", "Codex MCP", RequirementStatus.OK if mcp else RequirementStatus.MISSING, "configured" if mcp else "missing"),
                 CheckResult("codex-hooks", "Codex hooks", RequirementStatus.OK if hooks else RequirementStatus.MISSING, "configured" if hooks else "missing"),
@@ -606,7 +631,7 @@ class AiMemoryRequirement(EnvironmentRequirement):
         if harness == "opencode":
             config = context.home / ".config" / "opencode" / "opencode.json"
             plugin = context.home / ".config" / "opencode" / "plugins" / "ai-memory.ts"
-            mcp = safe_file_contains(config, "ai-memory")
+            mcp = json_mcp_server_configured(config)
             hooks = safe_file_contains(plugin, "ai-memory")
             return (
                 CheckResult("opencode-mcp", "OpenCode MCP", RequirementStatus.OK if mcp else RequirementStatus.MISSING, "configured" if mcp else "missing"),
@@ -614,23 +639,67 @@ class AiMemoryRequirement(EnvironmentRequirement):
             )
         if harness == "copilot":
             config = context.root / ".vscode" / "mcp.json"
-            mcp = safe_file_contains(config, "ai-memory")
+            mcp = json_mcp_server_configured(config, top_level_servers=True)
             return (
                 CheckResult("copilot-mcp", "Copilot MCP", RequirementStatus.OK if mcp else RequirementStatus.MISSING, "configured" if mcp else "missing"),
                 CheckResult("copilot-hooks", "Copilot hooks", RequirementStatus.UNSUPPORTED, "MCP only", required=False),
             )
         return ()
 
-    def _missing_actions(self, platform: PlatformInfo) -> tuple[RepairAction, ...]:
+    def _missing_actions(
+        self,
+        context: EnvironmentContext,
+        platform: PlatformInfo,
+    ) -> tuple[RepairAction, ...]:
         if platform.system.lower() != "darwin":
             return ()
         if architecture_artifact(platform.architecture) is None:
             return ()
+        binary = context.home / "Applications" / "ai-memory" / "ai-memory"
+        preview = [
+            f"download {AI_MEMORY_RELEASE_URL.format(architecture=architecture_artifact(platform.architecture))}",
+            f"{binary} init",
+            f"launchctl print gui/{os.getuid()}/{AI_MEMORY_LABEL}",
+            f"launchctl bootstrap gui/{os.getuid()} {context.home / 'Library' / 'LaunchAgents' / AI_MEMORY_LAUNCH_AGENT}",
+        ]
+        for harness in self.harnesses:
+            if not context.executable_finder(harness) or harness not in {"codex", "opencode", "copilot"}:
+                continue
+            preview.extend(self._integration_preview(context, str(binary), harness, "mcp"))
+            if harness != "copilot":
+                preview.extend(self._integration_preview(context, str(binary), harness, "hooks"))
         return (RepairAction(
             "ai-memory:install",
             "Download ai-memory from akitaonrails/ai-memory, initialize it, configure its LaunchAgent, and wire detected harnesses",
             self.id,
+            tuple(preview),
         ),)
+
+    def _automatic_install_check(self, platform: PlatformInfo) -> CheckResult:
+        if platform.system.lower() != "darwin":
+            return CheckResult(
+                "automatic-install",
+                "automatic installation",
+                RequirementStatus.UNSUPPORTED,
+                "automatic ai-memory installation is available only on macOS",
+                required=False,
+            )
+        architecture = architecture_artifact(platform.architecture)
+        if architecture is None:
+            return CheckResult(
+                "automatic-install",
+                "automatic installation",
+                RequirementStatus.UNSUPPORTED,
+                f"unsupported macOS architecture: {platform.architecture}",
+                required=False,
+            )
+        return CheckResult(
+            "automatic-install",
+            "automatic installation",
+            RequirementStatus.OK,
+            f"macOS {architecture} release available after approval",
+            required=False,
+        )
 
     def _repair_actions(
         self,
@@ -649,6 +718,11 @@ class AiMemoryRequirement(EnvironmentRequirement):
                 "ai-memory:service",
                 "Repair ai-memory LaunchAgent and local service",
                 self.id,
+                (
+                    f"launchctl print gui/{os.getuid()}/{AI_MEMORY_LABEL}",
+                    f"launchctl bootout gui/{os.getuid()}/{AI_MEMORY_LABEL} (only if registered)",
+                    f"launchctl bootstrap gui/{os.getuid()} {context.home / 'Library' / 'LaunchAgents' / AI_MEMORY_LAUNCH_AGENT}",
+                ),
             ))
         for harness in ("codex", "opencode", "copilot"):
             if f"{harness}-mcp" in by_id and by_id[f"{harness}-mcp"].status != RequirementStatus.OK:
@@ -656,14 +730,31 @@ class AiMemoryRequirement(EnvironmentRequirement):
                     f"ai-memory:{harness}-mcp",
                     f"Configure ai-memory MCP for {harness.title()}",
                     self.id,
+                    self._integration_preview(context, self._binary(context) or "ai-memory", harness, "mcp"),
                 ))
             if harness != "copilot" and f"{harness}-hooks" in by_id and by_id[f"{harness}-hooks"].status != RequirementStatus.OK:
                 actions.append(RepairAction(
                     f"ai-memory:{harness}-hooks",
                     f"Configure ai-memory lifecycle integration for {harness.title()}",
                     self.id,
+                    self._integration_preview(context, self._binary(context) or "ai-memory", harness, "hooks"),
                 ))
         return tuple(actions)
+
+    def _integration_preview(
+        self,
+        context: EnvironmentContext,
+        binary: str,
+        harness: str,
+        capability: str,
+    ) -> tuple[str, ...]:
+        if capability == "mcp":
+            client = "vscode-copilot" if harness == "copilot" else harness
+            command = f"{binary} install-mcp --client {client} --apply"
+            if harness == "copilot":
+                command += f" --config-file {context.root / '.vscode' / 'mcp.json'}"
+            return (command,)
+        return (f"{binary} install-hooks --agent {harness} --apply",)
 
     def _install_macos(self, context: EnvironmentContext, platform: PlatformInfo) -> OperationResult:
         if platform.system.lower() != "darwin":
@@ -876,6 +967,7 @@ class GlobalSkillRequirement(EnvironmentRequirement):
                 f"{self.id}:install",
                 self.install_description(),
                 self.id,
+                ("npx " + " ".join(self.install_command),),
             ),)
         overall_status = installed_status if installed_status != RequirementStatus.OK else requirement_status(checks)
         return RequirementResult(
@@ -964,6 +1056,10 @@ class CavemanRequirement(GlobalSkillRequirement):
     skill_name = "caveman"
     install_command = ("skills", "add", "JuliusBrussee/caveman", "-g")
     cli_listing_command = ("--no-install", "skills", "ls", "-g")
+    requires_verified_origin = True
+
+    def _origin_verified(self, directory: Path) -> bool:
+        return safe_file_contains(directory / ".skill-meta.json", "JuliusBrussee/caveman")
 
 
 class TlcSpecDrivenRequirement(GlobalSkillRequirement):

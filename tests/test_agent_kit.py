@@ -1082,6 +1082,8 @@ class AgentKitTest(unittest.TestCase):
             self.assertNotIn("PLANNED CHANGES:", checked.stdout)
             self.assertEqual(1, declined.returncode)
             self.assertIn("PLANNED CHANGES:", declined.stdout)
+            self.assertIn("$ npx skills add JuliusBrussee/caveman -g", declined.stdout)
+            self.assertIn("$ npx @tech-leads-club/agent-skills install -s tlc-spec-driven -g", declined.stdout)
             self.assertIn("NO CHANGES MADE.", declined.stdout)
             self.assertEqual(2, conflict.returncode)
             self.assertIn("cannot be combined", conflict.stderr)
@@ -1110,16 +1112,20 @@ class AgentKitTest(unittest.TestCase):
         codex = home / ".codex"
         codex.mkdir()
         (codex / "config.toml").write_text(
-            "[mcp_servers.ai-memory]\ncommand = 'ai-memory'\nhook = 'ai-memory'\n",
+            "[mcp_servers.ai-memory]\ncommand = 'ai-memory'\n",
+            encoding="utf-8",
+        )
+        (codex / "hooks.json").write_text(
+            '{"hooks": [{"command": "ai-memory", "args": ["hook"]}]}\n',
             encoding="utf-8",
         )
         opencode = home / ".config" / "opencode"
         (opencode / "plugins").mkdir(parents=True)
-        (opencode / "opencode.json").write_text('{"ai-memory": {}}\n', encoding="utf-8")
+        (opencode / "opencode.json").write_text('{"mcp": {"ai-memory": {}}}\n', encoding="utf-8")
         (opencode / "plugins" / "ai-memory.ts").write_text("ai-memory\n", encoding="utf-8")
         mcp = root / ".vscode"
         mcp.mkdir()
-        (mcp / "mcp.json").write_text('{"ai-memory": {}}\n', encoding="utf-8")
+        (mcp / "mcp.json").write_text('{"servers": {"ai-memory": {}}}\n', encoding="utf-8")
         for skill_name, metadata in (
             ("caveman", None),
             ("tlc-spec-driven", '{"source": "tech-leads-club/agent-skills"}\n'),

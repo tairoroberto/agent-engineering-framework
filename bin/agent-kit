@@ -1525,7 +1525,9 @@ def render_environment_report(report: environment_runtime.EnvironmentReport) -> 
 def render_environment_actions(actions: tuple[environment_runtime.RepairAction, ...]) -> str:
     """Show every pre-authorized action before a repair may start."""
     lines = ["PLANNED CHANGES:"]
-    lines.extend(f"- {action.description}" for action in actions)
+    for action in actions:
+        lines.append(f"- {action.description}")
+        lines.extend(f"  $ {command}" for command in action.preview)
     return "\n".join(lines)
 
 

@@ -377,9 +377,11 @@ agent-kit continue T33 \
   --provider openai
 ```
 
-Providers explícitos são estritos. Nesse exemplo, Developer, Reviewer e QA não
-podem migrar silenciosamente para outro provider. O Orchestrator continua no
-modelo de controle persistido na instalação.
+Providers explícitos são estritos para todos os papéis, incluindo o
+Orchestrator, que resolve dentro do provider solicitado. O modelo de controle
+persistido na instalação continua valendo quando pertence ao escopo
+solicitado. Nesse exemplo, Developer, Reviewer e QA não podem migrar
+silenciosamente para outro provider.
 
 Exemplos usuais por harness:
 
@@ -458,6 +460,53 @@ agent-kit init --force \
 
 Se o modelo não estiver disponível ou não alcançar o piso do control plane, o
 comando retorna `ORCHESTRATOR_UNAVAILABLE` sem downgrade silencioso.
+
+### 7.7 OpenCode com provider GitHub Copilot
+
+Em ambientes corporativos onde somente o GitHub Copilot é autorizado:
+
+```bash
+opencode
+```
+
+Dentro do OpenCode, execute `/connect`, selecione GitHub Copilot e autentique.
+A autenticação é do OpenCode; o framework nunca salva ou loga tokens. Confira
+os modelos liberados em `/models` e configure o projeto:
+
+```bash
+agent-kit init \
+  --profile flutter \
+  --harness opencode \
+  --provider copilot
+```
+
+Isso grava no `.agent-framework.toml`:
+
+```toml
+[provider]
+default = "copilot"
+allowed = ["copilot"]
+strict = true
+```
+
+Diagnóstico e teste de routing:
+
+```bash
+agent-kit env --check
+agent-kit doctor
+agent-kit catalog show
+agent-kit route simulate T33 \
+  --workflow continue \
+  --harness opencode \
+  --provider copilot \
+  --json
+```
+
+Sem `--provider`, o framework usa o default do projeto (`copilot`), nunca
+`auto` cross-provider. Falhas de quota ou indisponibilidade usam apenas
+fallbacks Copilot aprovados, ou retornam `CIRCUIT_OPEN`; sem modelo elegível,
+`ORCHESTRATOR_UNAVAILABLE` ou `COPILOT_PROVIDER_UNAVAILABLE` — nunca
+downgrade silencioso para outro provider.
 
 ## 8. Catálogo, consumo e fallback
 

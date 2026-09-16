@@ -44,6 +44,15 @@ approved provider fallback. If the
 active harness cannot cancel a pending child, dependent work stops and the
 operator cancels it in the harness UI.
 
+Corporate setups can run OpenCode as the harness with GitHub Copilot as the
+only allowed provider: authenticate via `/connect` inside OpenCode, then
+`agent-kit init --profile flutter --harness opencode --provider copilot`.
+The project persists `[provider]` with `default/allowed/strict`, discovers
+entitled Copilot models dynamically through `opencode models` (never stored
+credentials), and refuses silent fallback to any other provider. See
+[model routing and installation](docs/model-routing-and-installation.md) for
+the full flow (`env --check`, `doctor`, `catalog show`, `route simulate`).
+
 Before `continue`, `feature`, or `review` dispatches agents, `agent-kit` creates
 a hash-bound model proposal for Orchestrator, Developer, Reviewer, and
 risk/task-required QA. The

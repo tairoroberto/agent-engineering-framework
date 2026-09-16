@@ -67,6 +67,68 @@ then deterministic inference. LOW-confidence inference returns
 can raise but never reduce them. Metrics reorder candidates only within an
 eligible floor.
 
+## OpenCode with GitHub Copilot provider
+
+For corporate environments where OpenCode is the allowed harness and GitHub
+Copilot is the only authorized model provider, configure the project once:
+
+```bash
+opencode
+```
+
+Inside OpenCode, run `/connect`, select GitHub Copilot, and complete the
+OAuth/device login. Authentication stays with OpenCode; the framework never
+reads, persists, or logs Copilot tokens. Then check `/models` to confirm the
+entitled models.
+
+Back in the terminal:
+
+```bash
+agent-kit init \
+  --profile flutter \
+  --harness opencode \
+  --provider copilot
+```
+
+This persists `control harness = opencode`, `default provider = copilot`,
+`allowed provider = copilot`, and `strict provider = true` in
+`.agent-framework.toml`:
+
+```toml
+[provider]
+default = "copilot"
+allowed = ["copilot"]
+strict = true
+```
+
+Re-running `agent-kit init --force` without `--provider` reuses the persisted
+policy, like other persisted settings. Copilot models are discovered
+dynamically through the officially supported `opencode models --verbose`
+interface (`github-copilot` is normalized to the framework provider
+`copilot`); nothing is hardcoded because entitlements vary by company,
+account, plan, policy, and region.
+
+Diagnose and verify:
+
+```bash
+agent-kit env --check
+agent-kit doctor
+agent-kit catalog show
+agent-kit route simulate T33 \
+  --workflow continue \
+  --harness opencode \
+  --provider copilot \
+  --json
+```
+
+In strict mode there is no silent fallback to another provider: quota,
+rate-limit, or unavailable-model failures advance only within previously
+approved Copilot fallbacks, otherwise `CIRCUIT_OPEN`. A missing or
+unauthorized Copilot surfaces as `COPILOT_PROVIDER_UNAVAILABLE` in `doctor`
+and `ORCHESTRATOR_UNAVAILABLE` when no entitled model meets the
+control-plane floor. Omitting `--provider` resolves to the project default
+(`copilot`), never to cross-provider `auto`.
+
 ## Per-activity proposal and approval
 
 ```bash

@@ -14,6 +14,7 @@ from pathlib import Path
 import platform as platform_runtime
 import shutil
 import subprocess
+import tempfile
 from typing import Callable, Optional, Protocol, Sequence
 
 
@@ -348,6 +349,8 @@ def inspect_platform(context: EnvironmentContext) -> PlatformInfo:
 
 AI_MEMORY_LABEL = "com.github.akitaonrails.ai-memory"
 AI_MEMORY_HTTP_URL = "http://127.0.0.1:49374/mcp"
+AI_MEMORY_RELEASE_URL = "https://github.com/akitaonrails/ai-memory/releases/latest/download/ai-memory-macos-{architecture}.tar.gz"
+AI_MEMORY_LAUNCH_AGENT = "com.github.akitaonrails.ai-memory.plist"
 
 
 def detected_harnesses(context: EnvironmentContext, names: Sequence[str]) -> tuple[CheckResult, ...]:
@@ -435,6 +438,38 @@ class AiMemoryRequirement(EnvironmentRequirement):
             actions=actions,
             version=version,
         )
+
+    def repair(
+        self,
+        context: EnvironmentContext,
+        platform: PlatformInfo,
+        action_ids: set[str],
+    ) -> tuple[OperationResult, ...]:
+        operations: list[OperationResult] = []
+        binary = self._binary(context)
+        if "ai-memory:install" in action_ids:
+            installed = self._install_macos(context, platform)
+            operations.append(installed)
+            if not installed.succeeded:
+                return tuple(operations)
+            binary = self._binary(context)
+            if binary is None:
+                return tuple((*operations, OperationResult(
+                    "ai-memory:install", False, "installed binary was not discoverable",
+                )))
+            operations.append(self._configure_launchd(context, binary))
+            operations.extend(self._configure_detected_integrations(context, binary))
+            return tuple(operations)
+        if binary is None:
+            return ()
+        if "ai-memory:service" in action_ids:
+            operations.append(self._configure_launchd(context, binary))
+        for harness in ("codex", "opencode", "copilot"):
+            if f"ai-memory:{harness}-mcp" in action_ids:
+                operations.append(self._configure_integration(context, binary, harness, "mcp"))
+            if harness != "copilot" and f"ai-memory:{harness}-hooks" in action_ids:
+                operations.append(self._configure_integration(context, binary, harness, "hooks"))
+        return tuple(operations)
 
     def _binary(self, context: EnvironmentContext) -> str | None:
         found = context.executable_finder("ai-memory")
@@ -553,7 +588,7 @@ class AiMemoryRequirement(EnvironmentRequirement):
             return ()
         return (RepairAction(
             "ai-memory:install",
-            "Download ai-memory from akitaonrails/ai-memory and configure its LaunchAgent",
+            "Download ai-memory from akitaonrails/ai-memory, initialize it, configure its LaunchAgent, and wire detected harnesses",
             self.id,
         ),)
 
@@ -590,6 +625,128 @@ class AiMemoryRequirement(EnvironmentRequirement):
                 ))
         return tuple(actions)
 
+    def _install_macos(self, context: EnvironmentContext, platform: PlatformInfo) -> OperationResult:
+        if platform.system.lower() != "darwin":
+            return OperationResult("ai-memory:install", False, "automatic installation is supported only on macOS")
+        architecture = architecture_artifact(platform.architecture)
+        if architecture is None:
+            return OperationResult("ai-memory:install", False, f"unsupported architecture: {platform.architecture}")
+        curl = context.executable_finder("curl")
+        tar = context.executable_finder("tar") or "tar"
+        if not curl:
+            return OperationResult("ai-memory:install", False, "curl unavailable")
+        url = AI_MEMORY_RELEASE_URL.format(architecture=architecture)
+        try:
+            with tempfile.TemporaryDirectory(prefix="agent-kit-ai-memory-") as raw:
+                staging = Path(raw)
+                archive = staging / "ai-memory.tar.gz"
+                downloaded = context.runner.run((
+                    curl, "--fail", "--location", "--silent", "--show-error",
+                    "--output", str(archive), url,
+                ), timeout=120)
+                if not downloaded.succeeded:
+                    return OperationResult("ai-memory:install", False, command_failure(downloaded))
+                extracted = staging / "extracted"
+                extracted.mkdir()
+                unpacked = context.runner.run((tar, "-xzf", str(archive), "-C", str(extracted)), timeout=120)
+                if not unpacked.succeeded:
+                    return OperationResult("ai-memory:install", False, command_failure(unpacked))
+                binary, distribution = extracted_ai_memory_distribution(extracted)
+                if binary is None or distribution is None:
+                    return OperationResult("ai-memory:install", False, "release archive lacks ai-memory binary or launchd template")
+                target_dir = context.home / "Applications" / "ai-memory"
+                target_dir.mkdir(parents=True, exist_ok=True)
+                for source in distribution.iterdir():
+                    target = target_dir / source.name
+                    if source.is_dir():
+                        shutil.copytree(source, target, dirs_exist_ok=True)
+                    elif source.name != "ai-memory":
+                        shutil.copy2(source, target)
+                target_binary = target_dir / "ai-memory"
+                temporary_binary = target_dir / ".agent-kit-ai-memory"
+                shutil.copy2(binary, temporary_binary)
+                temporary_binary.chmod(temporary_binary.stat().st_mode | 0o111)
+                os.replace(temporary_binary, target_binary)
+                initialized = context.runner.run((str(target_binary), "init"), timeout=30)
+                if not initialized.succeeded:
+                    return OperationResult("ai-memory:install", False, command_failure(initialized))
+        except OSError as error:
+            return OperationResult("ai-memory:install", False, str(error))
+        return OperationResult("ai-memory:install", True, f"installed macOS {architecture} release")
+
+    def _configure_launchd(self, context: EnvironmentContext, binary: str) -> OperationResult:
+        if context.system.lower() != "darwin":
+            return OperationResult("ai-memory:service", False, "LaunchAgent repair is supported only on macOS")
+        template = Path(binary).parent / "packaging" / "launchd" / AI_MEMORY_LAUNCH_AGENT
+        try:
+            template_text = template.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            return OperationResult("ai-memory:service", False, f"cannot read launchd template: {error}")
+        if "__AI_MEMORY_BIN__" not in template_text or "__HOME__" not in template_text:
+            return OperationResult("ai-memory:service", False, "launchd template has required placeholders missing")
+        launch_agents = context.home / "Library" / "LaunchAgents"
+        logs = context.home / "Library" / "Logs" / "ai-memory"
+        plist = launch_agents / AI_MEMORY_LAUNCH_AGENT
+        try:
+            launch_agents.mkdir(parents=True, exist_ok=True)
+            logs.mkdir(parents=True, exist_ok=True)
+            plist.write_text(
+                template_text.replace("__AI_MEMORY_BIN__", binary).replace("__HOME__", str(context.home)),
+                encoding="utf-8",
+            )
+        except OSError as error:
+            return OperationResult("ai-memory:service", False, str(error))
+        launchctl = context.executable_finder("launchctl") or "launchctl"
+        domain = f"gui/{os.getuid()}"
+        registered = context.runner.run((launchctl, "print", f"{domain}/{AI_MEMORY_LABEL}"))
+        if registered.error or registered.timed_out:
+            return OperationResult("ai-memory:service", False, command_failure(registered))
+        if registered.succeeded:
+            removed = context.runner.run((launchctl, "bootout", f"{domain}/{AI_MEMORY_LABEL}"))
+            if not removed.succeeded:
+                return OperationResult("ai-memory:service", False, command_failure(removed))
+        loaded = context.runner.run((launchctl, "bootstrap", domain, str(plist)))
+        if not loaded.succeeded:
+            return OperationResult("ai-memory:service", False, command_failure(loaded))
+        return OperationResult("ai-memory:service", True, "LaunchAgent configured")
+
+    def _configure_detected_integrations(self, context: EnvironmentContext, binary: str) -> tuple[OperationResult, ...]:
+        operations: list[OperationResult] = []
+        for harness in self.harnesses:
+            if context.executable_finder(harness):
+                operations.append(self._configure_integration(context, binary, harness, "mcp"))
+                if harness != "copilot":
+                    operations.append(self._configure_integration(context, binary, harness, "hooks"))
+        return tuple(operations)
+
+    def _configure_integration(
+        self,
+        context: EnvironmentContext,
+        binary: str,
+        harness: str,
+        capability: str,
+    ) -> OperationResult:
+        if harness not in {"codex", "opencode", "copilot"}:
+            return OperationResult(f"ai-memory:{harness}-{capability}", False, "unsupported harness")
+        if harness == "copilot" and capability == "hooks":
+            return OperationResult("ai-memory:copilot-hooks", True, "not supported by Copilot")
+        if capability == "mcp":
+            client = "vscode-copilot" if harness == "copilot" else harness
+            argv: tuple[str, ...] = (binary, "install-mcp", "--client", client, "--apply")
+            if harness == "copilot":
+                argv = (*argv, "--config-file", str(context.root / ".vscode" / "mcp.json"))
+        else:
+            argv = (binary, "install-hooks", "--agent", harness, "--apply")
+        result = context.runner.run(argv, timeout=60)
+        action_id = f"ai-memory:{harness}-{capability}"
+        if not result.succeeded:
+            return OperationResult(action_id, False, command_failure(result))
+        verified = self._harness_checks(context, harness)
+        wanted = next((check for check in verified if check.id == f"{harness}-{capability}"), None)
+        if wanted is None or wanted.status != RequirementStatus.OK:
+            return OperationResult(action_id, False, "installer completed but integration verification failed")
+        return OperationResult(action_id, True, "configured")
+
 
 def architecture_artifact(architecture: str) -> str | None:
     """Translate macOS architecture facts to the official release suffix."""
@@ -599,3 +756,24 @@ def architecture_artifact(architecture: str) -> str | None:
     if normalized == "x86_64":
         return "x86_64"
     return None
+
+
+def command_failure(result: CommandResult) -> str:
+    """Summarize failures without copying arbitrary command output into reports."""
+    if result.timed_out:
+        return result.error or "timed out"
+    if result.error:
+        return result.error
+    return f"command exited {result.returncode}"
+
+
+def extracted_ai_memory_distribution(extracted: Path) -> tuple[Path | None, Path | None]:
+    """Locate only a release layout containing both the executable and template."""
+    for template in extracted.rglob(AI_MEMORY_LAUNCH_AGENT):
+        if template.parent.name != "launchd" or template.parent.parent.name != "packaging":
+            continue
+        distribution = template.parent.parent.parent
+        binary = distribution / "ai-memory"
+        if binary.is_file():
+            return binary, distribution
+    return None, None

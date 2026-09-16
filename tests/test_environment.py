@@ -24,6 +24,18 @@ class FakeRunner:
         return self.results.get(normalized, environment.CommandResult(normalized, 127, error="not configured"))
 
 
+class InstallRunner(FakeRunner):
+    def run(self, argv: tuple[str, ...], *, timeout: float = 10) -> environment.CommandResult:
+        normalized = tuple(argv)
+        if "tar" in Path(normalized[0]).name and "-C" in normalized:
+            extracted = Path(normalized[normalized.index("-C") + 1]) / "release"
+            template = extracted / "packaging" / "launchd" / environment.AI_MEMORY_LAUNCH_AGENT
+            template.parent.mkdir(parents=True)
+            (extracted / "ai-memory").write_text("binary\n", encoding="utf-8")
+            template.write_text("__AI_MEMORY_BIN__\n__HOME__\n", encoding="utf-8")
+        return super().run(normalized, timeout=timeout)
+
+
 class StaticRequirement(environment.EnvironmentRequirement):
     def __init__(self, result: environment.RequirementResult) -> None:
         self.id = result.id
@@ -230,6 +242,80 @@ class EnvironmentRuntimeTest(unittest.TestCase):
             self.assertEqual(environment.RequirementStatus.PARTIAL, result.status)
             self.assertEqual(environment.RequirementStatus.NOT_RUNNING, next(check.status for check in result.checks if check.id == "http"))
             self.assertEqual(("ai-memory:service",), tuple(action.id for action in result.actions))
+
+    def test_authorized_macos_install_selects_architecture_initializes_and_bootstraps_once(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            root = Path(raw) / "project"
+            home.mkdir()
+            root.mkdir()
+            label = f"gui/{environment.os.getuid()}/{environment.AI_MEMORY_LABEL}"
+            runner = InstallRunner({
+                ("/bin/curl", "--fail", "--location", "--silent", "--show-error", "--output"): environment.CommandResult(("placeholder",), 0),
+                ("/bin/launchctl", "print", label): environment.CommandResult(("/bin/launchctl", "print", label), 1),
+            })
+            original_run = runner.run
+
+            def run(argv: tuple[str, ...], *, timeout: float = 10) -> environment.CommandResult:
+                normalized = tuple(argv)
+                if normalized[0] == "/bin/curl":
+                    runner.calls.append(normalized)
+                    return environment.CommandResult(normalized, 0)
+                if normalized[0] == "/bin/tar":
+                    staging = Path(normalized[normalized.index("-C") + 1]) / "release"
+                    template = staging / "packaging" / "launchd" / environment.AI_MEMORY_LAUNCH_AGENT
+                    template.parent.mkdir(parents=True)
+                    (staging / "ai-memory").write_text("binary\n", encoding="utf-8")
+                    template.write_text("__AI_MEMORY_BIN__\n__HOME__\n", encoding="utf-8")
+                    runner.calls.append(normalized)
+                    return environment.CommandResult(normalized, 0)
+                if normalized[0].endswith("/Applications/ai-memory/ai-memory") and normalized[1:] == ("init",):
+                    runner.calls.append(normalized)
+                    return environment.CommandResult(normalized, 0)
+                if normalized[:2] == ("/bin/launchctl", "print"):
+                    runner.calls.append(normalized)
+                    return environment.CommandResult(normalized, 1)
+                if normalized[:2] == ("/bin/launchctl", "bootstrap"):
+                    runner.calls.append(normalized)
+                    return environment.CommandResult(normalized, 0)
+                return original_run(normalized, timeout=timeout)
+
+            runner.run = run  # type: ignore[assignment]
+            context = environment.EnvironmentContext(
+                root=root,
+                home=home,
+                runner=runner,
+                system="Darwin",
+                architecture="arm64",
+                executable_finder=lambda name: (
+                    str(home / "Applications" / "ai-memory" / "ai-memory")
+                    if name == "ai-memory" and (home / "Applications" / "ai-memory" / "ai-memory").is_file()
+                    else {
+                    "curl": "/bin/curl", "tar": "/bin/tar", "launchctl": "/bin/launchctl",
+                    }.get(name)
+                ),
+            )
+
+            operations = environment.AiMemoryRequirement(()).repair(
+                context, environment.PlatformInfo("Darwin", "arm64"), {"ai-memory:install"},
+            )
+
+            self.assertTrue(all(operation.succeeded for operation in operations))
+            self.assertTrue((home / "Applications" / "ai-memory" / "ai-memory").is_file())
+            self.assertIn("aarch64.tar.gz", runner.calls[0][-1])
+            plist = home / "Library" / "LaunchAgents" / environment.AI_MEMORY_LAUNCH_AGENT
+            self.assertIn(str(home / "Applications" / "ai-memory" / "ai-memory"), plist.read_text(encoding="utf-8"))
+            self.assertFalse(any(command[1:2] == ("bootout",) for command in runner.calls))
+
+    def test_macos_install_rejects_an_unknown_architecture_without_running_commands(self) -> None:
+        runner = FakeRunner({})
+        operation = environment.AiMemoryRequirement(())._install_macos(
+            self.context(runner), environment.PlatformInfo("Darwin", "ppc64"),
+        )
+
+        self.assertFalse(operation.succeeded)
+        self.assertIn("unsupported architecture", operation.detail or "")
+        self.assertFalse(runner.calls)
 
 
 if __name__ == "__main__":

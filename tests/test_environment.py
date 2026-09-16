@@ -207,7 +207,10 @@ class EnvironmentRuntimeTest(unittest.TestCase):
             codex = home / ".codex"
             codex.mkdir()
             (codex / "config.toml").write_text("[mcp_servers.ai-memory]\n", encoding="utf-8")
-            (codex / "hooks.json").write_text('{"hooks": [{"command": "ai-memory", "args": ["hook"]}]}\n', encoding="utf-8")
+            (codex / "hooks.json").write_text(
+                '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"ai-memory hook --event session-start"}]}]}}\n',
+                encoding="utf-8",
+            )
             opencode = home / ".config" / "opencode" / "plugins"
             opencode.mkdir(parents=True)
             (opencode.parent / "opencode.json").write_text('{"mcp":{"ai-memory":{}}}\n', encoding="utf-8")
@@ -261,7 +264,14 @@ class EnvironmentRuntimeTest(unittest.TestCase):
             self.assertEqual(environment.RequirementStatus.MISSING, missing[1].status)
 
             (codex / "hooks.json").write_text(
-                '{"hooks": [{"command": "ai-memory", "args": ["hook"]}]}\n',
+                '{"label":"ai-memory","hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"other"}]}]}}\n',
+                encoding="utf-8",
+            )
+            still_missing = environment.AiMemoryRequirement(())._harness_checks(context, "codex")
+            self.assertEqual(environment.RequirementStatus.MISSING, still_missing[1].status)
+
+            (codex / "hooks.json").write_text(
+                '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"ai-memory hook --event session-start"}]}]}}\n',
                 encoding="utf-8",
             )
             configured = environment.AiMemoryRequirement(())._harness_checks(context, "codex")

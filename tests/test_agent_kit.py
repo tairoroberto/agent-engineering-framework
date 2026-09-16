@@ -1116,7 +1116,7 @@ class AgentKitTest(unittest.TestCase):
             encoding="utf-8",
         )
         (codex / "hooks.json").write_text(
-            '{"hooks": [{"command": "ai-memory", "args": ["hook"]}]}\n',
+            '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"ai-memory hook --event session-start"}]}]}}\n',
             encoding="utf-8",
         )
         opencode = home / ".config" / "opencode"

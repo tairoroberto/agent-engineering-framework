@@ -451,6 +451,30 @@ def json_mcp_server_configured(path: Path, *, top_level_servers: bool = False) -
     return isinstance(servers, dict) and "ai-memory" in servers
 
 
+def json_codex_ai_memory_hooks_configured(path: Path) -> bool:
+    """Recognize an ai-memory command inside Codex's nested hooks schema."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    if not isinstance(hooks, dict):
+        return False
+    for registrations in hooks.values():
+        if not isinstance(registrations, list):
+            continue
+        for registration in registrations:
+            nested = registration.get("hooks") if isinstance(registration, dict) else None
+            if not isinstance(nested, list):
+                continue
+            for hook in nested:
+                command = hook.get("command") if isinstance(hook, dict) else None
+                normalized = command.lower() if isinstance(command, str) else ""
+                if "ai-memory" in normalized and "hook" in normalized:
+                    return True
+    return False
+
+
 class AiMemoryRequirement(EnvironmentRequirement):
     """Diagnose native ai-memory health and supported harness capabilities."""
 
@@ -623,7 +647,7 @@ class AiMemoryRequirement(EnvironmentRequirement):
             config = context.home / ".codex" / "config.toml"
             hooks_config = context.home / ".codex" / "hooks.json"
             mcp = safe_file_contains(config, "[mcp_servers.ai-memory]")
-            hooks = safe_file_contains(hooks_config, "ai-memory") and safe_file_contains(hooks_config, "hook")
+            hooks = json_codex_ai_memory_hooks_configured(hooks_config)
             return (
                 CheckResult("codex-mcp", "Codex MCP", RequirementStatus.OK if mcp else RequirementStatus.MISSING, "configured" if mcp else "missing"),
                 CheckResult("codex-hooks", "Codex hooks", RequirementStatus.OK if hooks else RequirementStatus.MISSING, "configured" if hooks else "missing"),

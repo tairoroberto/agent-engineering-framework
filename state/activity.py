@@ -62,6 +62,56 @@ def read_json(path: Path, label: str) -> dict[str, Any]:
     return value
 
 
+def manifest_provider_policy(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Normalized project provider policy with safe legacy defaults."""
+    settings = manifest.get("provider") or {}
+    if not isinstance(settings, dict):
+        settings = {}
+    default = settings.get("default")
+    allowed = settings.get("allowed")
+    strict = settings.get("strict", default is not None or allowed is not None)
+    return {
+        "default": default if isinstance(default, str) else None,
+        "allowed": list(allowed) if isinstance(allowed, list) else None,
+        "strict": bool(strict),
+    }
+
+
+def resolve_provider_scope(manifest: dict[str, Any], requested: str | None) -> tuple[str, str | set[str]]:
+    """Resolve omitted/explicit provider against the manifest policy.
+
+    Returns (identity_provider, candidate_scope). An omitted provider uses
+    the project default when configured — never silent cross-provider `auto`.
+    An explicit non-auto provider is strict and must be allowed, otherwise
+    PROVIDER_MISMATCH. Only `auto` (explicit, or legacy without a default)
+    may span providers, and a strict allowed list still constrains it.
+    """
+    policy = manifest_provider_policy(manifest)
+    allowed = policy["allowed"]
+    if requested is not None and requested != "auto":
+        if allowed is not None and requested not in allowed:
+            raise ValueError(f"PROVIDER_MISMATCH: provider {requested!r} is not allowed (allowed={allowed})")
+        return requested, requested
+    if requested is None and policy["default"] is not None:
+        default = policy["default"]
+        if allowed is not None and default not in allowed:
+            raise ValueError(f"PROVIDER_MISMATCH: default provider {default!r} is not allowed (allowed={allowed})")
+        return default, default
+    if policy["strict"] and allowed is not None:
+        scope: str | set[str] = set(allowed) if len(allowed) > 1 else allowed[0]
+        identity = "auto" if len(allowed) > 1 else allowed[0]
+        return identity, scope
+    return "auto", "auto"
+
+
+def provider_match(candidate: Any, scope: str | set[str]) -> bool:
+    if scope == "auto":
+        return True
+    if isinstance(scope, str):
+        return candidate == scope
+    return candidate in scope
+
+
 def select_harness(manifest: dict[str, Any], requested: str | None) -> str:
     harnesses = manifest.get("harnesses", [])
     selected = requested or os.environ.get("AGENT_KIT_HARNESS")
@@ -108,7 +158,7 @@ def load_mapping(root: Path, harness: str) -> dict[str, Any]:
     return value
 
 
-def mapping_options(mapping: dict[str, Any], family: str, class_name: str, provider: str) -> list[dict[str, Any]]:
+def mapping_options(mapping: dict[str, Any], family: str, class_name: str, provider: str | set[str]) -> list[dict[str, Any]]:
     entry = mapping.get(family, {}).get(class_name)
     if not isinstance(entry, dict):
         return []
@@ -118,11 +168,11 @@ def mapping_options(mapping: dict[str, Any], family: str, class_name: str, provi
         dict(value) for value in values
         if isinstance(value, dict)
         and isinstance(value.get("model"), str)
-        and (provider == "auto" or value.get("provider") == provider)
+        and provider_match(value.get("provider"), provider)
     ]
 
 
-def family_model_routes(mapping: dict[str, Any], family: str, provider: str) -> dict[str, dict[str, Any]]:
+def family_model_routes(mapping: dict[str, Any], family: str, provider: str | set[str]) -> dict[str, dict[str, Any]]:
     routes: dict[str, dict[str, Any]] = {}
     entries = mapping.get(family, {})
     if not isinstance(entries, dict):
@@ -145,14 +195,14 @@ def model_class(model: dict[str, Any]) -> str:
     return max(classes, key=class_rank) if classes else catalog.classify_model(str(model.get("id", "")))
 
 
-def catalog_models(lock: dict[str, Any], harness: str, provider: str) -> list[dict[str, Any]]:
+def catalog_models(lock: dict[str, Any], harness: str, provider: str | set[str]) -> list[dict[str, Any]]:
     entry = lock.get("harnesses", {}).get(harness, {})
     values = entry.get("models", []) if isinstance(entry, dict) else []
     return [
         value for value in values
         if isinstance(value, dict)
         and value.get("available", True)
-        and (provider == "auto" or value.get("provider") == provider)
+        and provider_match(value.get("provider"), provider)
     ]
 
 
@@ -197,7 +247,7 @@ def proposal_role(
     lock: dict[str, Any],
     mapping: dict[str, Any],
     harness: str,
-    provider: str,
+    provider: str | set[str],
     role: str,
     family: str,
     floor: str,
@@ -256,7 +306,8 @@ def proposal_role(
         pool = configured_models or eligible_values
         if not pool:
             prefix = "ORCHESTRATOR_UNAVAILABLE: " if role == "orchestrator" else ""
-            raise ValueError(f"{prefix}no eligible {provider} model for {role} at {floor}")
+            scope_label = provider if isinstance(provider, str) else f"one of {sorted(provider)}"
+            raise ValueError(f"{prefix}no eligible {scope_label} model for {role} at {floor}")
         if role == "orchestrator":
             ordered = [str(value["model"]) for value in mapped]
             chosen = min(pool, key=lambda value: ordered.index(value["model"]) if value["model"] in ordered else len(ordered))
@@ -304,9 +355,12 @@ def create_proposal(
     manifest: dict[str, Any],
     workflow: str,
     target: str,
-    provider: str,
+    provider: str | None,
     requested_harness: str | None,
 ) -> dict[str, Any]:
+    harness = select_harness(manifest, requested_harness)
+    effective_provider, scope = resolve_provider_scope(manifest, provider)
+    lock = catalog.load_catalog(root)
     harness = select_harness(manifest, requested_harness)
     lock = catalog.load_catalog(root)
     errors = catalog.validate_catalog(lock, [harness])
@@ -364,12 +418,12 @@ def create_proposal(
     if route.get("classification", {}).get("confidence") == "LOW":
         raise ValueError("CLASSIFICATION_REQUIRED: deterministic inference confidence is low; declare task Complexity and Risk")
     mapping = load_mapping(root, harness)
-    available_ids = {value["id"] for value in catalog_models(lock, harness, "auto")}
+    available_ids = {value["id"] for value in catalog_models(lock, harness, scope)}
     configured_orchestrator = manifest.get("orchestrator_model")
     orchestrator_model = configured_orchestrator if configured_orchestrator in available_ids else None
     roles = [
         proposal_role(
-            root, lock, mapping, harness, "auto" if role == "orchestrator" else provider,
+            root, lock, mapping, harness, scope,
             role, family, floor, orchestrator_model,
         )
         for role, family, floor in role_contracts(workflow, route)
@@ -392,7 +446,7 @@ def create_proposal(
         "feature": feature,
         "task": task_id,
         "harness": harness,
-        "provider": provider,
+        "provider": effective_provider,
         "inputs": inputs,
         "roles": [{"role": value["role"], "model": value["recommended"]["model"]} for value in roles],
     }

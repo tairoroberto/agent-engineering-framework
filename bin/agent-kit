@@ -45,6 +45,7 @@ WORKFLOWS = {
 HARNESS_RECORD = Path(".agent-managed/harness-adapters.json")
 AI_MEMORY_FILE = Path(".ai-memory.toml")
 AI_MEMORY_REQUIRED = ("workspace", "project", "drop_subagent_captures")
+MANIFEST_PROVIDERS = ("openai", "opencode", "openrouter", "copilot", "claude")
 SUPPORTED_HARNESSES = ("codex", "opencode", "copilot", "claude")
 HARNESS_DIRS = {
     "codex": Path(".codex"),
@@ -88,18 +89,26 @@ def qa_gate_permissions(profile: str) -> str:
     return "\n".join((common, profile_commands.get(profile, ""))).rstrip()
 
 
-def opencode_agent(role: str, mode: str, model: str, read_only: bool = False, *, profile: str = "generic") -> str:
-    base_role = role.removesuffix("-openai")
-    if base_role.startswith("qa-"):
-        base_role = "qa"
-    execution_provider = "openai" if role.endswith("-openai") else "opencode"
+def opencode_agent(role: str, mode: str, model: str, read_only: bool = False, *, profile: str = "generic", provider: str, base_role: str | None = None) -> str:
+    """Render one OpenCode role adapter with an explicit execution provider.
+
+    `role` names the generated file (it may carry a `-<provider>` suffix for
+    uniqueness). `base_role` is the engineering role (developer-low,
+    reviewer, qa, ...) and `provider` the execution provider; both are
+    passed explicitly by the generator. Nothing infers the provider from a
+    name. The model ID itself is provider-qualified (`<provider>/<model>`).
+    """
+    resolved_base = base_role or role
+    if resolved_base.startswith("qa-"):
+        resolved_base = "qa"
+    execution_provider = provider
     provider_guard = (
         f"For a dispatched task, require `PROVIDER: {execution_provider}` in the payload. "
         "If it names another provider, return `PROVIDER_MISMATCH` immediately; do not edit, run a gate, or retry."
-        if base_role.startswith("developer") or base_role in {"reviewer", "reviewer-specialist", "qa"} else ""
+        if resolved_base.startswith("developer") or resolved_base in {"reviewer", "reviewer-specialist", "qa"} else ""
     )
     if read_only:
-        qa_bash = qa_gate_permissions(profile) if base_role == "qa" else '    "*": deny'
+        qa_bash = qa_gate_permissions(profile) if resolved_base == "qa" else '    "*": deny'
         permissions = '''permission:
   "*": deny
   read: allow
@@ -111,7 +120,7 @@ def opencode_agent(role: str, mode: str, model: str, read_only: bool = False, *,
   task: deny
   bash:
 {QA_BASH}'''.replace("{QA_BASH}", qa_bash)
-    elif base_role == "orchestrator":
+    elif resolved_base == "orchestrator":
         # The Orchestrator is the single writer for canonical state/evidence,
         # not a second production implementer. Scope edits to feature artifacts.
         permissions = '''permission:
@@ -132,7 +141,7 @@ def opencode_agent(role: str, mode: str, model: str, read_only: bool = False, *,
     "git clean*": deny
     "git rebase*": deny
     "git commit --amend*": deny'''
-    elif base_role == "planner":
+    elif resolved_base == "planner":
         # Planning is limited to edit-tool writes under .specs. Shell denial
         # prevents redirection from bypassing the production-file boundary.
         permissions = '''permission:
@@ -179,15 +188,16 @@ def opencode_agent(role: str, mode: str, model: str, read_only: bool = False, *,
         "reviewer": "Fresh independent reviewer. Read-only. Return ranked, evidence-bearing findings to the Orchestrator; never fix code or self-approve.",
         "reviewer-specialist": "Fresh independent specialist reviewer. Read-only. Review only the dispatched capability and return evidence to the Orchestrator.",
         "qa": "Independent QA. Read-only. Execute only approved non-mutating verification and evaluate acceptance/failure scenarios from executable evidence; request an exact scenario run from the Orchestrator when evidence is missing. Before global gates, inspect task-owned paths/diff and worktree status. A failure only outside the dispatched boundary is `EXTERNAL_DIRTY_WORKTREE`: report command/path/boundary and scoped evidence; do not call the task defective, edit/reformat/revert it, or claim a clean-worktree verdict. Missing ownership evidence is BLOCKED. Never format or edit source, specs, tasks, state, handoffs, or validation reports. Return QAResult only; the Orchestrator owns canonical artifacts.",
-    }[base_role]
+    }[resolved_base]
     return f'''---
 description: "Shared {role} adapter; project policy remains external."
 mode: {mode}
 model: "{model}"
-reasoningEffort: {role_effort(base_role)}
+reasoningEffort: {role_effort(resolved_base)}
 {permissions}
 ---
 
+Route: harness=opencode provider={execution_provider} model="{model}" role={resolved_base}
 Load the dispatched role capsule, current project AGENTS.md, and only the relevant shared protocol/profile sections.
 {instructions}
 {provider_guard}
@@ -291,11 +301,99 @@ Harness: {harness}. Project rules and canonical state remain external.
 '''
 
 
+OPENCODE_STATIC_PROVIDERS = {"opencode", "openai"}
+# Discovered-provider agent topology: portable class -> (agent base role, read-only).
+# Agent files are named `<base>-<provider>.md`; the provider is always passed
+# explicitly to opencode_agent, never inferred from the file name.
+OPENCODE_EXTRA_AGENT_ROLES = {
+    ("modelClasses", "cost-efficient-coding"): ("developer-low", False),
+    ("modelClasses", "balanced-coding"): ("developer", False),
+    ("modelClasses", "strong-coding"): ("developer-high", False),
+    ("modelClasses", "strongest-appropriate"): ("developer-critical", False),
+    ("reviewClasses", "independent-reviewer"): ("reviewer", True),
+    ("reviewClasses", "specialist-review"): ("reviewer-specialist", True),
+    ("qaClasses", "qa-basic"): ("qa-basic", True),
+    ("qaClasses", "qa-targeted"): ("qa-targeted", True),
+    ("qaClasses", "qa-adversarial"): ("qa-adversarial", True),
+}
+OPENCODE_CLASS_RANK = ("cost-efficient-coding", "balanced-coding", "strong-coding", "strongest-appropriate")
+
+
+def opencode_extra_candidates(
+    static_routing: dict,
+    extra_models: list[dict],
+) -> tuple[dict, list[tuple]]:
+    """Append discovered-provider candidates to a parsed static routing map.
+
+    Returns the extended map plus role files to generate as
+    (agent, base_role, mode, model, readonly, provider). Models whose
+    provider is statically covered, or already listed, are skipped so legacy
+    output stays byte-identical when no extras apply.
+    """
+    known = {
+        (option.get("provider"), option.get("model"))
+        for family in ("modelClasses", "reviewClasses", "qaClasses")
+        for entry in [static_routing.get(family, {})]
+        if isinstance(entry, dict)
+        for value in entry.values() if isinstance(value, dict)
+        for option in (value.get("candidates") if isinstance(value.get("candidates"), list) else [value])
+        if isinstance(option, dict)
+    }
+    assignments: dict[tuple[str, str, bool, str], list[dict]] = {}
+    for item in extra_models:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            continue
+        provider = str(item.get("provider") or "")
+        model = item["id"]
+        if not provider or provider in OPENCODE_STATIC_PROVIDERS or (provider, model) in known:
+            continue
+        classes = [value for value in (item.get("classes") or []) if isinstance(value, str)]
+        targets = [
+            (family, class_name) for family in ("modelClasses", "reviewClasses", "qaClasses")
+            for class_name in classes
+            if (family, class_name) in OPENCODE_EXTRA_AGENT_ROLES
+        ]
+        # Every discovered model is also a review/QA candidate: capability
+        # floors (not candidacy) decide eligibility, so reviewer and QA
+        # planes always have a provider-local pool to filter.
+        for extra in (("reviewClasses", "independent-reviewer"), ("reviewClasses", "specialist-review"), ("qaClasses", "qa-basic"), ("qaClasses", "qa-targeted"), ("qaClasses", "qa-adversarial")):
+            if extra not in targets:
+                targets.append(extra)
+        if not targets:
+            targets = [("modelClasses", "balanced-coding")]
+        for family, class_name in targets:
+            base_role, readonly = OPENCODE_EXTRA_AGENT_ROLES[(family, class_name)]
+            agent = f"{base_role}-{provider}"
+            entry = static_routing.setdefault(family, {}).setdefault(class_name, {})
+            candidates = entry.setdefault("candidates", [])
+            if isinstance(candidates, list) and not any(
+                isinstance(option, dict) and option.get("model") == model for option in candidates
+            ):
+                candidates.append({"agent": agent, "model": model, "provider": provider})
+            assignments.setdefault((agent, base_role, readonly, provider), []).append(item)
+    roles: list[tuple] = []
+    for (agent, base_role, readonly, provider), items in sorted(assignments.items()):
+        ranked = sorted(
+            items,
+            key=lambda item: max(
+                [OPENCODE_CLASS_RANK.index(value) for value in (item.get("classes") or []) if value in OPENCODE_CLASS_RANK],
+                default=-1,
+            ),
+            reverse=True,
+        )
+        representative = ranked[0]["id"]
+        mode = "primary" if base_role == "orchestrator" else "subagent"
+        roles.append((agent, base_role, mode, representative, readonly, provider))
+    return static_routing, roles
+
+
 def harness_templates(
     harness: str,
     *,
     profile: str = "generic",
     orchestrator_model: str | None = None,
+    extra_models: list[dict] | None = None,
+    allowed_providers: list[str] | None = None,
 ) -> dict[str, str]:
     if harness == "opencode":
         templates = {
@@ -303,8 +401,45 @@ def harness_templates(
             "gates.md": "# OpenCode gates adapter\n\nCanonical commands and policy: project rules, selected profile, and `docs/engineering-gates.md` when present. Do not define project commands here.\n",
             "routing.json": json.dumps({"schemaVersion": 1, "modelClasses": {"cost-efficient-coding": {"candidates": [{"agent": "developer-low", "model": "opencode/mimo-v2.5-free", "provider": "opencode"}, {"agent": "developer", "model": "opencode/big-pickle", "provider": "opencode"}, {"agent": "developer-low-openai", "model": "openai/gpt-5.6-luna", "provider": "openai"}]}, "balanced-coding": {"candidates": [{"agent": "developer", "model": "opencode/big-pickle", "provider": "opencode"}, {"agent": "developer-high", "model": "opencode/muse-spark-1.3-contributor-free", "provider": "opencode"}, {"agent": "developer-critical", "model": "opencode/nemotron-3-ultra-free", "provider": "opencode"}, {"agent": "developer-openai", "model": "openai/gpt-5.5", "provider": "openai"}]}, "strong-coding": {"candidates": [{"agent": "developer-high", "model": "opencode/muse-spark-1.3-contributor-free", "provider": "opencode"}, {"agent": "developer-critical", "model": "opencode/nemotron-3-ultra-free", "provider": "opencode"}, {"agent": "developer-high-openai", "model": "openai/gpt-5.6-sol", "provider": "openai"}]}, "strongest-appropriate": {"candidates": [{"agent": "developer-critical", "model": "opencode/nemotron-3-ultra-free", "provider": "opencode"}, {"agent": "developer-high", "model": "opencode/muse-spark-1.3-contributor-free", "provider": "opencode"}, {"agent": "developer-critical-openai", "model": "openai/gpt-6-astra", "provider": "openai"}]}}, "reviewClasses": {"independent-reviewer": {"candidates": [{"agent": "reviewer", "model": "opencode/nemotron-3-ultra-free", "provider": "opencode"}, {"agent": "reviewer-openai", "model": "openai/gpt-5.6-terra", "provider": "openai"}]}, "specialist-review": {"candidates": [{"agent": "reviewer-specialist", "model": "opencode/muse-spark-1.3-contributor-free", "provider": "opencode"}, {"agent": "reviewer-specialist-openai", "model": "openai/gpt-5.6-sol", "provider": "openai"}]}}, "qaClasses": {"qa-basic": {"candidates": [{"agent": "qa-basic", "model": "opencode/mimo-v2.5-free", "provider": "opencode"}, {"agent": "qa-basic-openai", "model": "openai/gpt-5.6-luna", "provider": "openai"}]}, "qa-targeted": {"candidates": [{"agent": "qa-targeted", "model": "opencode/big-pickle", "provider": "opencode"}, {"agent": "qa-targeted-openai", "model": "openai/gpt-5.5", "provider": "openai"}]}, "qa-adversarial": {"candidates": [{"agent": "qa-adversarial", "model": "opencode/nemotron-3-ultra-free", "provider": "opencode"}, {"agent": "qa-adversarial-openai", "model": "openai/gpt-5.6-sol", "provider": "openai"}]} }}, indent=2) + "\n",
         }
-        roles = (("orchestrator", "primary", orchestrator_model or "opencode/nemotron-3-ultra-free", False), ("planner", "subagent", "opencode/muse-spark-1.3-contributor-free", False), ("developer-low", "subagent", "opencode/mimo-v2.5-free", False), ("developer", "subagent", "opencode/big-pickle", False), ("developer-high", "subagent", "opencode/muse-spark-1.3-contributor-free", False), ("developer-critical", "subagent", "opencode/nemotron-3-ultra-free", False), ("developer-low-openai", "subagent", "openai/gpt-5.6-luna", False), ("developer-openai", "subagent", "openai/gpt-5.5", False), ("developer-high-openai", "subagent", "openai/gpt-5.6-sol", False), ("developer-critical-openai", "subagent", "openai/gpt-6-astra", False), ("reviewer", "subagent", "opencode/nemotron-3-ultra-free", True), ("reviewer-specialist", "subagent", "opencode/muse-spark-1.3-contributor-free", True), ("reviewer-openai", "subagent", "openai/gpt-5.6-terra", True), ("reviewer-specialist-openai", "subagent", "openai/gpt-5.6-sol", True), ("qa", "subagent", "opencode/mimo-v2.5-free", True), ("qa-basic", "subagent", "opencode/mimo-v2.5-free", True), ("qa-targeted", "subagent", "opencode/big-pickle", True), ("qa-adversarial", "subagent", "opencode/nemotron-3-ultra-free", True), ("qa-basic-openai", "subagent", "openai/gpt-5.6-luna", True), ("qa-targeted-openai", "subagent", "openai/gpt-5.5", True), ("qa-adversarial-openai", "subagent", "openai/gpt-5.6-sol", True))
-        templates.update({f"agents/{role}.md": opencode_agent(role, mode, model, readonly, profile=profile) for role, mode, model, readonly in roles})
+        selected_orchestrator = orchestrator_model or "opencode/nemotron-3-ultra-free"
+        orchestrator_provider = model_catalog.normalize_provider(
+            selected_orchestrator.split("/", 1)[0] if "/" in selected_orchestrator else "opencode", "opencode",
+        )
+        planner_model = "opencode/muse-spark-1.3-contributor-free"
+        if allowed_providers is not None:
+            if orchestrator_provider in allowed_providers:
+                planner_model = selected_orchestrator
+            elif extra_models:
+                planner_model = extra_models[0]["id"]
+        # (file role, base role, mode, model, read-only, provider): the
+        # provider is explicit per entry; `-openai` is only a file-name
+        # suffix preserved for backward compatibility.
+        roles = (("orchestrator", "orchestrator", "primary", selected_orchestrator, False, orchestrator_provider), ("planner", "planner", "subagent", planner_model, False, model_catalog.normalize_provider(planner_model.split("/", 1)[0] if "/" in planner_model else "opencode", "opencode")), ("developer-low", "developer-low", "subagent", "opencode/mimo-v2.5-free", False, "opencode"), ("developer", "developer", "subagent", "opencode/big-pickle", False, "opencode"), ("developer-high", "developer-high", "subagent", "opencode/muse-spark-1.3-contributor-free", False, "opencode"), ("developer-critical", "developer-critical", "subagent", "opencode/nemotron-3-ultra-free", False, "opencode"), ("developer-low-openai", "developer-low", "subagent", "openai/gpt-5.6-luna", False, "openai"), ("developer-openai", "developer", "subagent", "openai/gpt-5.5", False, "openai"), ("developer-high-openai", "developer-high", "subagent", "openai/gpt-5.6-sol", False, "openai"), ("developer-critical-openai", "developer-critical", "subagent", "openai/gpt-6-astra", False, "openai"), ("reviewer", "reviewer", "subagent", "opencode/nemotron-3-ultra-free", True, "opencode"), ("reviewer-specialist", "reviewer-specialist", "subagent", "opencode/muse-spark-1.3-contributor-free", True, "opencode"), ("reviewer-openai", "reviewer", "subagent", "openai/gpt-5.6-terra", True, "openai"), ("reviewer-specialist-openai", "reviewer-specialist", "subagent", "openai/gpt-5.6-sol", True, "openai"), ("qa", "qa", "subagent", "opencode/mimo-v2.5-free", True, "opencode"), ("qa-basic", "qa-basic", "subagent", "opencode/mimo-v2.5-free", True, "opencode"), ("qa-targeted", "qa-targeted", "subagent", "opencode/big-pickle", True, "opencode"), ("qa-adversarial", "qa-adversarial", "subagent", "opencode/nemotron-3-ultra-free", True, "opencode"), ("qa-basic-openai", "qa-basic", "subagent", "openai/gpt-5.6-luna", True, "openai"), ("qa-targeted-openai", "qa-targeted", "subagent", "openai/gpt-5.5", True, "openai"), ("qa-adversarial-openai", "qa-adversarial", "subagent", "openai/gpt-5.6-sol", True, "openai"))
+        if allowed_providers is not None:
+            # Strict projects keep no executable route outside the allowed
+            # providers: filter static candidates and drop disallowed role
+            # files (orchestrator/planner always stay, on an allowed model).
+            routing_map = json.loads(templates["routing.json"])
+            for family_entries in routing_map.values():
+                if not isinstance(family_entries, dict):
+                    continue
+                for entry in family_entries.values():
+                    if isinstance(entry, dict) and isinstance(entry.get("candidates"), list):
+                        entry["candidates"] = [
+                            option for option in entry["candidates"]
+                            if isinstance(option, dict) and option.get("provider") in allowed_providers
+                        ]
+            templates["routing.json"] = json.dumps(routing_map) + "\n"
+            roles = tuple(
+                entry for entry in roles
+                if entry[5] in allowed_providers or entry[0] in ("orchestrator", "planner")
+            )
+        if extra_models:
+            routing_map = json.loads(templates["routing.json"])
+            routing_map, extra_roles = opencode_extra_candidates(routing_map, extra_models)
+            templates["routing.json"] = json.dumps(routing_map) + "\n"
+            roles = (*roles, *extra_roles)
+        templates.update({f"agents/{file_role}.md": opencode_agent(file_role, mode, model, readonly, profile=profile, provider=provider, base_role=base_role) for file_role, base_role, mode, model, readonly, provider in roles})
         return templates
     if harness == "codex":
         routes = {
@@ -357,7 +492,49 @@ def harness_templates(
     raise ValueError(harness)
 
 
-def sync_harness_adapters(root: Path, data: dict, *, replace_managed: bool = False) -> list[str]:
+def adapter_extra_models(harness: str, data: dict, catalog: dict | None) -> list[dict]:
+    """Discovered-provider models missing from the static harness templates.
+
+    Only providers in the manifest `allowed` list that the static templates
+    do not cover (e.g. `copilot` under the `opencode` harness) produce
+    extras. Projects without a `[provider]` block get no extras, so legacy
+    generated output stays byte-identical.
+    """
+    if harness != "opencode" or not isinstance(catalog, dict):
+        return []
+    allowed = manifest_provider(data).get("allowed")
+    if not allowed:
+        return []
+    models = catalog.get("harnesses", {}).get(harness, {}).get("models", [])
+    if not isinstance(models, list):
+        return []
+    return [
+        value for value in models
+        if isinstance(value, dict)
+        and isinstance(value.get("id"), str)
+        and value.get("provider") in allowed
+        and value.get("provider") not in OPENCODE_STATIC_PROVIDERS
+        and value.get("available", True)
+    ]
+
+
+def adapter_template_options(harness: str, data: dict, catalog: dict | None) -> dict:
+    """Template options binding the manifest provider policy to generation.
+
+    Strict projects with an allowed list get executable routes only for
+    those providers (static candidates filtered, discovered providers
+    appended). Legacy projects without a policy get unfiltered templates
+    and no extras.
+    """
+    policy = manifest_provider(data)
+    strict_allowed = policy["allowed"] if policy.get("strict") else None
+    return {
+        "extra_models": adapter_extra_models(harness, data, catalog) or None,
+        "allowed_providers": strict_allowed,
+    }
+
+
+def sync_harness_adapters(root: Path, data: dict, *, replace_managed: bool = False, extra_models: list[dict] | None = None, allowed_providers: list[str] | None = None) -> list[str]:
     if data.get("harness", {}).get("managed_adapters", True) is False:
         return []
     record_path = root / HARNESS_RECORD
@@ -375,10 +552,13 @@ def sync_harness_adapters(root: Path, data: dict, *, replace_managed: bool = Fal
             fail(f"invalid managed harness record: {record_path}")
     planned: list[tuple[str, Path, bytes, bytes | None, str | None]] = []
     for harness in data["harnesses"]:
+        harness_extras = [value for value in (extra_models or [])] if harness == "opencode" else None
         for relative, content in harness_templates(
             harness,
             profile=data["profile"],
             orchestrator_model=data.get("orchestrator_model") if harness == data["harnesses"][0] else None,
+            extra_models=harness_extras,
+            allowed_providers=allowed_providers,
         ).items():
             target_relative = (HARNESS_DIRS[harness] / relative).as_posix()
             target = root / target_relative
@@ -412,7 +592,7 @@ def sync_harness_adapters(root: Path, data: dict, *, replace_managed: bool = Fal
     return changed
 
 
-def prune_obsolete_managed_adapters(root: Path, data: dict) -> list[str]:
+def prune_obsolete_managed_adapters(root: Path, data: dict, extra_models: list[dict] | None = None, allowed_providers: list[str] | None = None) -> list[str]:
     """Remove only obsolete files named by the ownership ledger.
 
     Harness directories are never removed recursively, so project extensions in
@@ -430,6 +610,8 @@ def prune_obsolete_managed_adapters(root: Path, data: dict) -> list[str]:
             harness,
             profile=data["profile"],
             orchestrator_model=data.get("orchestrator_model") if harness == data["harnesses"][0] else None,
+            extra_models=[value for value in (extra_models or [])] if harness == "opencode" else None,
+            allowed_providers=allowed_providers,
         )
     }
     if "opencode" in data["harnesses"]:
@@ -545,7 +727,59 @@ def parse_manifest(root: Path) -> dict:
         fail("manifest ai_memory must be boolean")
     if data.get("orchestrator_model") is not None and not isinstance(data.get("orchestrator_model"), str):
         fail("manifest orchestrator_model must be a string")
+    provider_settings = data.get("provider", {})
+    if provider_settings is None:
+        provider_settings = {}
+    if not isinstance(provider_settings, dict):
+        fail("manifest provider must be a table")
+    default_provider = provider_settings.get("default")
+    allowed_providers = provider_settings.get("allowed")
+    strict_provider = provider_settings.get("strict", default_provider is not None or allowed_providers is not None)
+    if default_provider is not None and default_provider not in MANIFEST_PROVIDERS:
+        fail(f"manifest provider.default must be one of {', '.join(MANIFEST_PROVIDERS)}")
+    if allowed_providers is not None:
+        if not isinstance(allowed_providers, list) or not allowed_providers or any(item not in MANIFEST_PROVIDERS for item in allowed_providers):
+            fail(f"manifest provider.allowed must be a non-empty list of {', '.join(MANIFEST_PROVIDERS)}")
+        if default_provider is not None and default_provider not in allowed_providers:
+            fail("manifest provider.default must be listed in provider.allowed")
+    if not isinstance(strict_provider, bool):
+        fail("manifest provider.strict must be boolean")
     return data
+
+
+def manifest_provider(manifest: dict) -> dict:
+    """Normalized project provider policy with safe legacy defaults."""
+    settings = manifest.get("provider") or {}
+    if not isinstance(settings, dict):
+        settings = {}
+    default = settings.get("default")
+    allowed = settings.get("allowed")
+    strict = settings.get("strict", default is not None or allowed is not None)
+    return {
+        "default": default,
+        "allowed": list(allowed) if isinstance(allowed, list) else None,
+        "strict": bool(strict),
+    }
+
+
+def provider_block_text(default: str | None, allowed: list[str] | None, strict: bool) -> str:
+    lines = ["[provider]"]
+    if default is not None:
+        lines.append(f"default = {json.dumps(default)}")
+    if allowed is not None:
+        lines.append("allowed = [" + ", ".join(json.dumps(item) for item in allowed) + "]")
+    lines.append(f"strict = {'true' if strict else 'false'}")
+    return "\n".join(lines) + "\n"
+
+
+def replace_provider_block(text: str, default: str | None, allowed: list[str] | None, strict: bool) -> str:
+    block = provider_block_text(default, allowed, strict)
+    pattern = re.compile(r"^\[provider\].*?(?=^\[|\Z)", re.MULTILINE | re.DOTALL)
+    if pattern.search(text):
+        return pattern.sub(block, text, count=1)
+    if not text.endswith("\n"):
+        text += "\n"
+    return text + "\n" + block
 
 
 def replace_manifest_value(text: str, key: str, value: str) -> str:
@@ -562,6 +796,10 @@ def write_manifest(
     *,
     force: bool = False,
     orchestrator_model: str | None = None,
+    provider_default: str | None = None,
+    provider_allowed: list[str] | None = None,
+    provider_strict: bool | None = None,
+    preserve_provider: bool = False,
 ) -> None:
     path = manifest_path(root)
     if path.exists():
@@ -582,6 +820,18 @@ def write_manifest(
     text = replace_manifest_value(text, "harnesses", "[" + ", ".join(f'"{item}"' for item in harnesses) + "]")
     if orchestrator_model:
         text = replace_manifest_value(text, "orchestrator_model", json.dumps(orchestrator_model))
+    if provider_default is not None or provider_allowed is not None or provider_strict is not None:
+        if provider_default is not None and provider_default not in MANIFEST_PROVIDERS:
+            fail(f"unsupported provider: {provider_default}")
+        allowed = provider_allowed if provider_allowed is not None else ([provider_default] if provider_default else None)
+        if allowed is not None and any(item not in MANIFEST_PROVIDERS for item in allowed):
+            fail(f"unsupported provider in allowed list: {allowed}")
+        if provider_default is not None and allowed is not None and provider_default not in allowed:
+            fail("provider default must be listed in provider allowed")
+        strict = provider_strict if provider_strict is not None else True
+        text = replace_provider_block(text, provider_default, allowed, strict)
+    elif preserve_provider:
+        pass
     path.write_text(text, encoding="utf-8")
 
 
@@ -751,11 +1001,20 @@ def ensure_model_catalog(root: Path, data: dict, args: argparse.Namespace, *, fo
 def select_orchestrator_model(root: Path, data: dict, catalog: dict, requested: str | None) -> str:
     configured = requested or data.get("orchestrator_model")
     primary = data["harnesses"][0]
+    policy = manifest_provider(data)
+    allowed = policy.get("allowed")
     models = catalog.get("harnesses", {}).get(primary, {}).get("models", [])
     available = [value for value in models if isinstance(value, dict) and value.get("available", True)]
+    if allowed:
+        available = [value for value in available if value.get("provider") in allowed]
     if configured:
         match = next((value for value in available if value.get("id") == configured), None)
         if match is None:
+            if allowed and any(
+                isinstance(value, dict) and value.get("id") == configured and value.get("available", True)
+                for value in models
+            ):
+                fail(f"PROVIDER_MISMATCH: {configured!r} is not in the allowed providers {allowed}")
             fail(f"ORCHESTRATOR_UNAVAILABLE: {configured!r} is not available in control harness {primary}")
         classes = match.get("classes", [])
         if not any(value in {"strong-coding", "strongest-appropriate"} for value in classes):
@@ -765,9 +1024,26 @@ def select_orchestrator_model(root: Path, data: dict, catalog: dict, requested: 
     entry = mapping.get("modelClasses", {}).get("strongest-appropriate", {})
     candidates = entry.get("candidates") if isinstance(entry, dict) else None
     options = candidates if isinstance(candidates, list) else [entry]
+    if allowed:
+        options = [
+            option for option in options
+            if isinstance(option, dict) and (option.get("provider") in allowed or "provider" not in option)
+        ]
     for option in options:
         if isinstance(option, dict) and any(value.get("id") == option.get("model") for value in available):
             return str(option["model"])
+    if allowed:
+        eligible = [value for value in available if any(
+            cls in {"strong-coding", "strongest-appropriate"} for cls in (value.get("classes") or [])
+        )]
+        if eligible:
+            by_class = {"strongest-appropriate": 1, "strong-coding": 0}
+            eligible.sort(key=lambda value: (
+                max([by_class.get(cls, -1) for cls in (value.get("classes") or [])], default=-1),
+                str(value.get("id")),
+            ), reverse=True)
+            return str(eligible[0]["id"])
+        fail(f"ORCHESTRATOR_UNAVAILABLE: no allowed {allowed} model meets the strong control-plane floor for {primary}")
     fail(f"ORCHESTRATOR_UNAVAILABLE: no strongest-appropriate model for control harness {primary}")
 
 
@@ -785,6 +1061,7 @@ def preflight_reinstall_catalog(
     harnesses: list[str],
     args: argparse.Namespace,
     configured_orchestrator: str | None,
+    provider_policy: dict | None = None,
 ) -> tuple[dict, str, str]:
     """Stage harness mappings and validate model availability before project writes."""
     if args.reuse_model_lock:
@@ -802,7 +1079,8 @@ def preflight_reinstall_catalog(
     with tempfile.TemporaryDirectory(prefix="agent-kit-reinstall-") as raw:
         staged = Path(raw)
         for harness in harnesses:
-            for relative, content in harness_templates(harness, profile=profile).items():
+            staged_allowed = provider_policy["allowed"] if provider_policy and harness == "opencode" else None
+            for relative, content in harness_templates(harness, profile=profile, allowed_providers=staged_allowed).items():
                 target = staged / HARNESS_DIRS[harness] / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content, encoding="utf-8")
@@ -814,7 +1092,7 @@ def preflight_reinstall_catalog(
                 fail("reinstall model preflight failed: " + "; ".join(errors))
         selected = select_orchestrator_model(
             staged,
-            {"harnesses": harnesses},
+            {"harnesses": harnesses, **({"provider": provider_policy} if provider_policy else {})},
             value,
             args.orchestrator_model or configured_orchestrator,
         )
@@ -1056,7 +1334,7 @@ def remove_path(path: Path) -> None:
         path.unlink()
 
 
-def reinstall_paths(root: Path, harnesses: list[str]) -> list[Path]:
+def reinstall_paths(root: Path, harnesses: list[str], extra_models: list[dict] | None = None, allowed_providers: list[str] | None = None) -> list[Path]:
     paths = {
         root / ".agent-framework.toml",
         root / "AGENTS.md",
@@ -1074,7 +1352,11 @@ def reinstall_paths(root: Path, harnesses: list[str]) -> list[Path]:
             if isinstance(relative, str) and relative and not Path(relative).is_absolute() and ".." not in Path(relative).parts:
                 paths.add(root / relative)
     for harness in harnesses:
-        for relative in harness_templates(harness).keys():
+        for relative in harness_templates(
+            harness,
+            extra_models=[value for value in (extra_models or [])] if harness == "opencode" else None,
+            allowed_providers=allowed_providers,
+        ).keys():
             paths.add(root / HARNESS_DIRS[harness] / relative)
     for workflow in WORKFLOWS:
         paths.add(root / ".opencode" / "commands" / f"{workflow}.md")
@@ -1236,6 +1518,21 @@ def open_tasks(root: Path, features_root: Path, feature: str | None, statuses: s
     return rows
 
 
+def static_providers_for(harness: str) -> set[str]:
+    """Providers with static template candidates for a harness."""
+    return {
+        "opencode": set(OPENCODE_STATIC_PROVIDERS),
+        "codex": {"openai"},
+        "copilot": {"copilot"},
+        "claude": {"claude"},
+    }.get(harness, {harness})
+
+
+def provider_needs_discovery(harness: str, provider: str | None) -> bool:
+    """A non-statically-covered provider requires live model discovery."""
+    return bool(provider) and provider not in static_providers_for(harness)
+
+
 def command_init(args: argparse.Namespace) -> None:
     root = Path(args.root).resolve()
     if not root.is_dir():
@@ -1256,6 +1553,25 @@ def command_init(args: argparse.Namespace) -> None:
     if args.force and not manifest_was_valid and not args.harness:
         fail("init --force requires at least one --harness when no valid manifest exists")
     harnesses = args.harness or (list(existing["harnesses"]) if existing else ["codex", "opencode"])
+    requested_provider: str | None = getattr(args, "provider", None)
+    if requested_provider is not None and requested_provider not in MANIFEST_PROVIDERS:
+        fail(f"unsupported provider: {requested_provider}")
+    existing_policy = manifest_provider(existing) if isinstance(existing, dict) else {"default": None, "allowed": None, "strict": False}
+    if requested_provider is not None:
+        provider_default: str | None = requested_provider
+        provider_allowed: list[str] | None = [requested_provider]
+        provider_strict: bool | None = True
+    elif args.force and isinstance(existing, dict) and (existing_policy.get("default") or existing_policy.get("allowed")):
+        # Reuse the persisted provider policy, like other persisted settings.
+        provider_default = existing_policy.get("default")
+        provider_allowed = existing_policy.get("allowed")
+        provider_strict = existing_policy.get("strict", True)
+    else:
+        provider_default = provider_allowed = None
+        provider_strict = None
+    effective_provider = provider_default or (existing_policy.get("default") if args.force else None)
+    if provider_needs_discovery(harnesses[0], effective_provider):
+        args.discover_models = True
     staged_catalog: dict | None = None
     staged_catalog_status = "refreshed"
     staged_orchestrator: str | None = None
@@ -1265,13 +1581,28 @@ def command_init(args: argparse.Namespace) -> None:
             if existing is not None and not args.harness and args.orchestrator_model is None
             else None
         )
+        preflight_policy: dict | None = None
+        if effective_provider:
+            preflight_policy = {"default": effective_provider, "allowed": [effective_provider], "strict": True}
         staged_catalog, staged_catalog_status, staged_orchestrator = preflight_reinstall_catalog(
-            root, profile, harnesses, args, configured_orchestrator,
+            root, profile, harnesses, args, configured_orchestrator, provider_policy=preflight_policy,
         )
     backup: Path | None = None
     inventory: dict[str, str] = {}
     if args.force:
-        affected = reinstall_paths(root, sorted(set((*harnesses, *((existing or {}).get("harnesses", []))))))
+        staged_extras = adapter_extra_models(
+            "opencode",
+            {"harnesses": harnesses, **({"provider": preflight_policy} if preflight_policy else {})},
+            staged_catalog,
+        ) if "opencode" in harnesses else []
+        staged_options = {
+            "extra_models": staged_extras or None,
+            "allowed_providers": (preflight_policy["allowed"] if preflight_policy else None),
+        }
+        affected = reinstall_paths(
+            root, sorted(set((*harnesses, *((existing or {}).get("harnesses", []))))),
+            **staged_options,
+        )
         print("INIT_FORCE_PATHS:")
         for path in affected:
             print(f"- {path.relative_to(root)}")
@@ -1286,11 +1617,15 @@ def command_init(args: argparse.Namespace) -> None:
         write_manifest(
             root, profile, harnesses, force=args.force,
             orchestrator_model=staged_orchestrator or args.orchestrator_model,
+            provider_default=provider_default,
+            provider_allowed=provider_allowed,
+            provider_strict=provider_strict,
         )
         data = parse_manifest(root)
+        policy = manifest_provider(data)
         copy_assets(root, profile, force=args.force)
         changed = sync_agents(root, backup=True, force=args.force)
-        adapters = sync_harness_adapters(root, data, replace_managed=args.force)
+        adapters = sync_harness_adapters(root, data, replace_managed=args.force, **adapter_template_options("opencode", data, staged_catalog))
         removed_adapters = prune_obsolete_managed_adapters(root, data) if args.force else []
         commands = sync_opencode_commands(root, data, backup=True, force=args.force)
         if staged_catalog is not None:
@@ -1298,16 +1633,25 @@ def command_init(args: argparse.Namespace) -> None:
             catalog_status, catalog = staged_catalog_status, staged_catalog
         else:
             catalog_status, catalog = ensure_model_catalog(root, data, args, force=args.force)
+        options = adapter_template_options("opencode", data, catalog)
+        if options["extra_models"] or options["allowed_providers"]:
+            adapters = sorted(set((*adapters, *sync_harness_adapters(root, data, replace_managed=args.force, **options))))
+        # A provider policy change obsoletes disallowed managed files even
+        # outside --force; prune only ledger-owned paths, never project files.
+        if args.force or options["allowed_providers"]:
+            removed_adapters = sorted(set((*removed_adapters, *prune_obsolete_managed_adapters(root, data, **options))))
         orchestrator_model = select_orchestrator_model(
             root, data, catalog, staged_orchestrator or args.orchestrator_model,
         )
         persist_orchestrator_model(root, orchestrator_model)
         data = parse_manifest(root)
-        aligned_adapters = sync_harness_adapters(root, data, replace_managed=args.force)
+        aligned_adapters = sync_harness_adapters(root, data, replace_managed=args.force, **adapter_template_options("opencode", data, catalog))
         adapters = sorted(set((*adapters, *aligned_adapters)))
         memory_status, memory_detail = ensure_ai_memory_config(root, data, args)
         print(f"MODEL_CATALOG: {catalog_status} ({catalog['fingerprint'][:12]})")
         print(f"ORCHESTRATOR_MODEL: {orchestrator_model}")
+        if policy.get("default") or policy.get("allowed"):
+            print(f"PROVIDER: default={policy.get('default')} allowed={policy.get('allowed')} strict={str(policy.get('strict')).lower()}")
         print(f"AI_MEMORY: {memory_status}" + (f" ({memory_detail})" if memory_detail else ""))
         if args.force:
             command_doctor(args)
@@ -1334,13 +1678,20 @@ def command_sync(args: argparse.Namespace) -> None:
     data = parse_manifest(root)
     copy_assets(root, data["profile"])
     changed = sync_agents(root, backup=False)
-    adapters = sync_harness_adapters(root, data, replace_managed=args.replace_managed)
+    try:
+        existing_lock = model_catalog.load_catalog(root)
+    except ValueError:
+        existing_lock = None
+    adapters = sync_harness_adapters(root, data, replace_managed=args.replace_managed, **adapter_template_options("opencode", data, existing_lock))
     commands = sync_opencode_commands(root, data, backup=False)
     catalog_status, catalog = ensure_model_catalog(root, data, args)
+    options = adapter_template_options("opencode", data, catalog)
+    if options["extra_models"] or options["allowed_providers"]:
+        adapters = sorted(set((*adapters, *sync_harness_adapters(root, data, replace_managed=args.replace_managed, **options))))
     orchestrator_model = select_orchestrator_model(root, data, catalog, None)
     persist_orchestrator_model(root, orchestrator_model)
     data = parse_manifest(root)
-    aligned_adapters = sync_harness_adapters(root, data, replace_managed=args.replace_managed)
+    aligned_adapters = sync_harness_adapters(root, data, replace_managed=args.replace_managed, **adapter_template_options("opencode", data, catalog))
     adapters = sorted(set((*adapters, *aligned_adapters)))
     memory_status, memory_detail = ensure_ai_memory_config(root, data, args)
     print(f"SYNC: {root}")
@@ -1350,6 +1701,73 @@ def command_sync(args: argparse.Namespace) -> None:
     print(f"AGENTS: {'updated' if changed else 'unchanged'}")
     print(f"HARNESS_ADAPTERS: {len(adapters)} updated")
     print(f"OPENCODE_COMMANDS: {','.join(commands) if commands else 'unchanged'}")
+
+
+def iter_route_candidates(mapping: dict) -> list[tuple[str, str, dict]]:
+    """Flatten a harness routing map to (family, class, candidate) triples."""
+    rows: list[tuple[str, str, dict]] = []
+    if not isinstance(mapping, dict):
+        return rows
+    for family in ("modelClasses", "reviewClasses", "qaClasses"):
+        entries = mapping.get(family, {})
+        if not isinstance(entries, dict):
+            continue
+        for class_name, value in entries.items():
+            if not isinstance(value, dict):
+                continue
+            candidates = value.get("candidates")
+            options = candidates if isinstance(candidates, list) else [value]
+            for option in options:
+                if isinstance(option, dict):
+                    rows.append((family, str(class_name), option))
+    return rows
+
+
+def check_forbidden_routes(root: Path, data: dict, allowed: list[str]) -> list[str]:
+    """A strict project must have no executable route outside allowed providers."""
+    problems: list[str] = []
+    for harness in data["harnesses"]:
+        path = root / HARNESS_DIRS[harness] / "routing.json"
+        try:
+            mapping = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for family, class_name, option in iter_route_candidates(mapping):
+            provider = option.get("provider", harness)
+            if provider not in allowed:
+                problems.append(
+                    f"FORBIDDEN_ROUTE: {harness}.{family}.{class_name} uses provider {provider!r} (allowed={allowed})"
+                )
+    return problems
+
+
+def check_executable_routes(root: Path, data: dict, catalog: dict, allowed: list[str]) -> list[str]:
+    """The control harness must offer at least one allowed, available route per plane."""
+    problems: list[str] = []
+    primary = data["harnesses"][0]
+    path = root / HARNESS_DIRS[primary] / "routing.json"
+    try:
+        mapping = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return [f"UNROUTABLE: {primary} routing map is missing or invalid"]
+    available = {
+        str(value.get("id"))
+        for value in catalog.get("harnesses", {}).get(primary, {}).get("models", [])
+        if isinstance(value, dict) and value.get("available", True) and value.get("provider") in allowed
+    }
+    for family, class_name in (("modelClasses", "strongest-appropriate"), ("modelClasses", "balanced-coding")):
+        entry = mapping.get(family, {}).get(class_name, {}) if isinstance(mapping, dict) else {}
+        candidates = entry.get("candidates") if isinstance(entry, dict) else None
+        options = candidates if isinstance(candidates, list) else [entry]
+        runnable = [
+            option for option in options
+            if isinstance(option, dict) and option.get("provider") in allowed and option.get("model") in available
+        ]
+        plane = "orchestrator" if class_name == "strongest-appropriate" else "developer"
+        print(f"EXECUTION_ROUTE {plane}: {'ready' if runnable else 'missing'}")
+        if not runnable:
+            problems.append(f"UNROUTABLE: no allowed {allowed} route for {plane} on {primary}")
+    return problems
 
 
 def command_doctor(args: argparse.Namespace) -> None:
@@ -1409,12 +1827,34 @@ def command_doctor(args: argparse.Namespace) -> None:
         catalog_errors = [str(error)]
     errors.extend(catalog_errors)
     print(f"MODEL_CATALOG: {'invalid' if catalog_errors else catalog['fingerprint'][:12]}")
+    policy = manifest_provider(data)
+    if policy.get("default") or policy.get("allowed"):
+        print(f"PROVIDER: default={policy.get('default')} allowed={policy.get('allowed')} strict={str(policy.get('strict')).lower()}")
+    else:
+        print("PROVIDER: legacy (no project policy; omitted provider resolves to auto)")
+    extras_by_harness: dict[str, dict] = {}
     if catalog is not None and not catalog_errors:
         try:
             orchestrator_model = select_orchestrator_model(root, data, catalog, None)
             print(f"ORCHESTRATOR_MODEL: {orchestrator_model}")
         except SystemExit:
             errors.append("ORCHESTRATOR_UNAVAILABLE")
+        extras_by_harness["opencode"] = adapter_template_options("opencode", data, catalog)
+        if policy.get("strict") and policy.get("allowed"):
+            forbidden = check_forbidden_routes(root, data, policy["allowed"])
+            for detail in forbidden:
+                errors.append(detail)
+            executable = check_executable_routes(root, data, catalog, policy["allowed"])
+            for detail in executable:
+                errors.append(detail)
+        for provider in sorted(set(policy.get("allowed") or []) - OPENCODE_STATIC_PROVIDERS):
+            status = model_catalog.provider_discovery_status(root, data["harnesses"][0], provider)
+            state = status["state"]
+            print(f"PROVIDER_STATUS {provider}: {state} ({len(status['models'])} models)")
+            if state == "harness-missing":
+                warnings.append(f"{provider} probe skipped: control harness executable not found")
+            elif state != "available":
+                errors.append(f"{provider.upper()}_PROVIDER_UNAVAILABLE: {state}")
     for harness in data["harnesses"]:
         adapter = managed / "harness" / f"{harness}.md"
         print(f"HARNESS {harness}: {'adapter-ready' if adapter.is_file() else 'missing-adapter'}")
@@ -1427,6 +1867,7 @@ def command_doctor(args: argparse.Namespace) -> None:
                 harness,
                 profile=profile,
                 orchestrator_model=data.get("orchestrator_model") if harness == data["harnesses"][0] else None,
+                **extras_by_harness.get(harness, {}),
             )
             for relative, content in expected_files.items():
                 target = root / HARNESS_DIRS[harness] / relative
@@ -1531,6 +1972,111 @@ def render_environment_actions(actions: tuple[environment_runtime.RepairAction, 
     return "\n".join(lines)
 
 
+def project_route_readiness(root: Path, data: dict, catalog: dict | None, allowed: list[str] | None) -> dict[str, bool]:
+    """Per-plane executability within the allowed providers, secret-free."""
+    planes = {
+        "orchestrator": ("modelClasses", "strongest-appropriate"),
+        "developer": ("modelClasses", "balanced-coding"),
+        "reviewer": ("reviewClasses", "independent-reviewer"),
+        "qa": ("qaClasses", "qa-targeted"),
+    }
+    primary = data["harnesses"][0]
+    try:
+        mapping = json.loads((root / HARNESS_DIRS[primary] / "routing.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {plane: False for plane in planes}
+    available = set()
+    if isinstance(catalog, dict):
+        available = {
+            str(value.get("id"))
+            for value in catalog.get("harnesses", {}).get(primary, {}).get("models", [])
+            if isinstance(value, dict) and value.get("available", True)
+            and (allowed is None or value.get("provider") in allowed)
+        }
+    readiness: dict[str, bool] = {}
+    for plane, (family, class_name) in planes.items():
+        entry = mapping.get(family, {}).get(class_name, {}) if isinstance(mapping, dict) else {}
+        candidates = entry.get("candidates") if isinstance(entry, dict) else None
+        options = candidates if isinstance(candidates, list) else [entry]
+        readiness[plane] = any(
+            isinstance(option, dict)
+            and (allowed is None or option.get("provider", primary) in allowed)
+            and option.get("model") in available
+            for option in options
+        )
+    return readiness
+
+
+def project_provider_report(root: Path) -> dict | None:
+    """Project-scoped harness/provider/route diagnosis; None without a manifest.
+
+    Never reads or prints credentials: availability comes from exit codes
+    and model IDs only (see catalog.provider_discovery_status).
+    """
+    if not manifest_path(root).is_file():
+        return None
+    try:
+        data = parse_manifest(root)
+    except SystemExit:
+        return None
+    policy = manifest_provider(data)
+    primary = data["harnesses"][0]
+    harness_installed = shutil.which(HARNESS_EXECUTABLES[primary]) is not None
+    if policy.get("allowed"):
+        interest = list(policy["allowed"])
+    elif policy.get("default"):
+        interest = [policy["default"]]
+    else:
+        interest = sorted(set(configured_providers(root, primary))) or [primary]
+    try:
+        catalog = model_catalog.load_catalog(root)
+        catalog_errors = model_catalog.validate_catalog(catalog, data["harnesses"])
+        if catalog_errors:
+            catalog = None
+    except ValueError:
+        catalog = None
+    providers = []
+    for provider in interest:
+        if not harness_installed:
+            state, count = "harness-missing", 0
+        else:
+            status = model_catalog.provider_discovery_status(root, primary, provider)
+            state, count = status["state"], len(status["models"])
+        providers.append({"provider": provider, "state": state, "models": count})
+    routes = project_route_readiness(root, data, catalog, policy.get("allowed"))
+    healthy = (
+        harness_installed
+        and all(item["state"] == "available" for item in providers)
+        and all(routes.values())
+    )
+    return {
+        "harness": {"id": primary, "installed": harness_installed},
+        "policy": policy,
+        "providers": providers,
+        "routes": routes,
+        "catalog": "ready" if catalog is not None else "missing",
+        "healthy": healthy,
+    }
+
+
+def render_project_report(report: dict) -> str:
+    lines = ["PROJECT EXECUTION"]
+    harness = report["harness"]
+    lines.append(f"HARNESS {harness['id']}: {'OK' if harness['installed'] else 'MISSING'}")
+    policy = report["policy"]
+    if policy.get("default") or policy.get("allowed"):
+        lines.append(f"PROVIDER POLICY: default={policy.get('default')} allowed={policy.get('allowed')} strict={str(policy.get('strict')).lower()}")
+    else:
+        lines.append("PROVIDER POLICY: legacy (omitted provider resolves to auto)")
+    for item in report["providers"]:
+        detail = f"{item['models']} models" if item["state"] == "available" else item["state"]
+        lines.append(f"PROVIDER {item['provider']}: {item['state'].upper()} ({detail})")
+    for plane, ready in report["routes"].items():
+        lines.append(f"EXECUTION ROUTE {plane}: {'OK' if ready else 'MISSING'}")
+    lines.append("PROJECT: READY" if report["healthy"] else "PROJECT: ATTENTION REQUIRED")
+    return "\n".join(lines)
+
+
 def command_env(args: argparse.Namespace) -> None:
     """Diagnose local prerequisites and repair only explicitly approved actions."""
     if args.json and args.yes:
@@ -1543,13 +2089,19 @@ def command_env(args: argparse.Namespace) -> None:
         harnesses=SUPPORTED_HARNESSES,
     )
     report = service.inspect()
+    project = project_provider_report(root)
     if args.json:
-        print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False, sort_keys=True))
-        if not report.healthy:
+        payload = report.to_dict()
+        if project is not None:
+            payload["project"] = project
+        print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+        if not report.healthy or (project is not None and not project["healthy"]):
             raise SystemExit(1)
         return
     print(render_environment_report(report))
-    if report.healthy:
+    if project is not None:
+        print(render_project_report(project))
+    if report.healthy and (project is None or project["healthy"]):
         return
     if args.check:
         raise SystemExit(1)
@@ -1590,7 +2142,7 @@ def command_catalog(args: argparse.Namespace) -> None:
         selected = select_orchestrator_model(root, data, value, args.orchestrator_model)
         persist_orchestrator_model(root, selected)
         data = parse_manifest(root)
-        sync_harness_adapters(root, data, replace_managed=False)
+        sync_harness_adapters(root, data, replace_managed=False, **adapter_template_options("opencode", data, value))
     else:
         try:
             value = model_catalog.load_catalog(root)
@@ -1791,6 +2343,7 @@ def command_diff(args: argparse.Namespace) -> None:
         catalog_errors = model_catalog.validate_catalog(catalog, data["harnesses"])
         print(f"MODEL_CATALOG: {'invalid' if catalog_errors else 'preserve'}")
     except ValueError:
+        catalog = None
         print("MODEL_CATALOG: create")
     if "opencode" in data["harnesses"]:
         for workflow in WORKFLOWS:
@@ -1806,6 +2359,7 @@ def command_diff(args: argparse.Namespace) -> None:
                     harness,
                     profile=data["profile"],
                     orchestrator_model=data.get("orchestrator_model") if harness == data["harnesses"][0] else None,
+                    **adapter_template_options(harness, data, catalog),
                 ).items()
                 if not (root / HARNESS_DIRS[harness] / relative).is_file()
                 or (root / HARNESS_DIRS[harness] / relative).read_text(encoding="utf-8") != content
@@ -1822,6 +2376,7 @@ def main() -> None:
     init = sub.add_parser("init")
     init.add_argument("--profile")
     init.add_argument("--harness", action="append", choices=SUPPORTED_HARNESSES)
+    init.add_argument("--provider", choices=MANIFEST_PROVIDERS, help="default execution provider to validate and persist")
     init.add_argument("--force", action="store_true", help="back up and reinstall framework-owned project configuration")
     init.add_argument("--yes", action="store_true", help="approve a non-interactive forced reinstall")
     init.add_argument("--reuse-model-lock", action="store_true", help="reuse an existing valid model catalog lock")
@@ -1861,7 +2416,7 @@ def main() -> None:
     for workflow in WORKFLOWS:
         activity = sub.add_parser(workflow)
         activity.add_argument("target", nargs="?")
-        activity.add_argument("--provider", choices=("auto", "openai", "opencode", "openrouter", "copilot", "claude"), default="auto")
+        activity.add_argument("--provider", choices=("auto", "openai", "opencode", "openrouter", "copilot", "claude"), default=None, help="execution provider; omitted uses the project default when configured")
         activity.add_argument("--harness", choices=SUPPORTED_HARNESSES)
         activity.add_argument("--propose", action="store_true")
         activity.add_argument("--approve")
@@ -1911,7 +2466,7 @@ def main() -> None:
         route_parser = route_sub.add_parser(route_name)
         route_parser.add_argument("target")
         route_parser.add_argument("--workflow", choices=tuple(WORKFLOWS), default="continue")
-        route_parser.add_argument("--provider", choices=("auto", "openai", "opencode", "openrouter", "copilot", "claude"), default="auto")
+        route_parser.add_argument("--provider", choices=("auto", "openai", "opencode", "openrouter", "copilot", "claude"), default=None, help="execution provider; omitted uses the project default when configured")
         route_parser.add_argument("--harness", choices=SUPPORTED_HARNESSES)
         route_parser.add_argument("--json", action="store_true")
     route.set_defaults(func=command_route)

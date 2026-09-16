@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -146,6 +147,89 @@ class EnvironmentRuntimeTest(unittest.TestCase):
         self.assertEqual("10.0.0", facts.npm_version)
         self.assertIsNone(facts.npx_version)
         self.assertEqual([("/bin/node", "--version"), ("/bin/npm", "--version")], runner.calls)
+
+    def test_ai_memory_missing_on_macos_offers_only_the_official_install_action(self) -> None:
+        result = environment.AiMemoryRequirement(("codex",)).diagnose(
+            self.context(), environment.PlatformInfo("Darwin", "arm64"),
+        )
+
+        self.assertEqual(environment.RequirementStatus.MISSING, result.status)
+        self.assertEqual(("ai-memory:install",), tuple(action.id for action in result.actions))
+        self.assertEqual("aarch64", environment.architecture_artifact("arm64"))
+        self.assertEqual("x86_64", environment.architecture_artifact("x86_64"))
+        self.assertIsNone(environment.architecture_artifact("ppc64"))
+
+    def test_ai_memory_running_with_http_405_and_integrations_is_healthy(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            root = Path(raw) / "project"
+            data = home / "Library" / "Application Support" / "ai-memory"
+            data.mkdir(parents=True)
+            root.mkdir()
+            (data / "config.toml").write_text("ready = true\n", encoding="utf-8")
+            codex = home / ".codex"
+            codex.mkdir()
+            (codex / "config.toml").write_text("[mcp_servers.ai-memory]\n[hooks.ai-memory]\n", encoding="utf-8")
+            opencode = home / ".config" / "opencode" / "plugins"
+            opencode.mkdir(parents=True)
+            (opencode.parent / "opencode.json").write_text('{"mcp":{"ai-memory":{}}}\n', encoding="utf-8")
+            (opencode / "ai-memory.ts").write_text("ai-memory\n", encoding="utf-8")
+            vscode = root / ".vscode"
+            vscode.mkdir()
+            (vscode / "mcp.json").write_text('{"servers":{"ai-memory":{}}}\n', encoding="utf-8")
+            runner = FakeRunner({
+                ("/bin/ai-memory", "--version"): environment.CommandResult(("/bin/ai-memory", "--version"), 0, stdout="ai-memory 2.1.0\n"),
+                ("/bin/ai-memory", "status"): environment.CommandResult(("/bin/ai-memory", "status"), 0, stdout="connected\n"),
+                ("/bin/launchctl", "print", f"gui/{environment.os.getuid()}/{environment.AI_MEMORY_LABEL}"): environment.CommandResult(("/bin/launchctl", "print", f"gui/{environment.os.getuid()}/{environment.AI_MEMORY_LABEL}"), 0, stdout="state = running\n"),
+                ("/bin/curl", "--silent", "--show-error", "--output", environment.os.devnull, "--write-out", "%{http_code}", environment.AI_MEMORY_HTTP_URL): environment.CommandResult(("/bin/curl", "--silent", "--show-error", "--output", environment.os.devnull, "--write-out", "%{http_code}", environment.AI_MEMORY_HTTP_URL), 0, stdout="405"),
+            })
+            context = environment.EnvironmentContext(
+                root=root,
+                home=home,
+                runner=runner,
+                system="Darwin",
+                architecture="arm64",
+                executable_finder=lambda name: {
+                    "ai-memory": "/bin/ai-memory", "launchctl": "/bin/launchctl", "curl": "/bin/curl",
+                    "codex": "/bin/codex", "opencode": "/bin/opencode", "copilot": "/bin/copilot",
+                }.get(name),
+            )
+
+            result = environment.AiMemoryRequirement(("codex", "opencode", "copilot")).diagnose(
+                context, environment.inspect_platform(context),
+            )
+
+            self.assertEqual(environment.RequirementStatus.OK, result.status)
+            self.assertEqual("HTTP 405", next(check.detail for check in result.checks if check.id == "http"))
+            self.assertEqual(environment.RequirementStatus.UNSUPPORTED, next(check.status for check in result.checks if check.id == "copilot-hooks"))
+            self.assertFalse(result.actions)
+
+    def test_ai_memory_is_partial_when_launchd_is_loaded_but_http_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw)
+            data = home / "Library" / "Application Support" / "ai-memory"
+            data.mkdir(parents=True)
+            (data / "config.toml").write_text("ready = true\n", encoding="utf-8")
+            runner = FakeRunner({
+                ("/bin/ai-memory", "--version"): environment.CommandResult(("/bin/ai-memory", "--version"), 0, stdout="ai-memory 2.1.0\n"),
+                ("/bin/ai-memory", "status"): environment.CommandResult(("/bin/ai-memory", "status"), 1, stderr="server unreachable\n"),
+                ("/bin/launchctl", "print", f"gui/{environment.os.getuid()}/{environment.AI_MEMORY_LABEL}"): environment.CommandResult(("/bin/launchctl", "print", f"gui/{environment.os.getuid()}/{environment.AI_MEMORY_LABEL}"), 0, stdout="state = running\n"),
+                ("/bin/curl", "--silent", "--show-error", "--output", environment.os.devnull, "--write-out", "%{http_code}", environment.AI_MEMORY_HTTP_URL): environment.CommandResult(("/bin/curl", "--silent", "--show-error", "--output", environment.os.devnull, "--write-out", "%{http_code}", environment.AI_MEMORY_HTTP_URL), 7, stdout="000"),
+            })
+            context = environment.EnvironmentContext(
+                root=home,
+                home=home,
+                runner=runner,
+                system="Darwin",
+                architecture="arm64",
+                executable_finder=lambda name: {"ai-memory": "/bin/ai-memory", "launchctl": "/bin/launchctl", "curl": "/bin/curl"}.get(name),
+            )
+
+            result = environment.AiMemoryRequirement(()).diagnose(context, environment.inspect_platform(context))
+
+            self.assertEqual(environment.RequirementStatus.PARTIAL, result.status)
+            self.assertEqual(environment.RequirementStatus.NOT_RUNNING, next(check.status for check in result.checks if check.id == "http"))
+            self.assertEqual(("ai-memory:service",), tuple(action.id for action in result.actions))
 
 
 if __name__ == "__main__":

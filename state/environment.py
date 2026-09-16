@@ -7,7 +7,7 @@ without duplicating dependency behavior.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 import os
 from pathlib import Path
@@ -344,3 +344,258 @@ def inspect_platform(context: EnvironmentContext) -> PlatformInfo:
         npm_version=versions["npm"],
         npx_version=versions["npx"],
     )
+
+
+AI_MEMORY_LABEL = "com.github.akitaonrails.ai-memory"
+AI_MEMORY_HTTP_URL = "http://127.0.0.1:49374/mcp"
+
+
+def detected_harnesses(context: EnvironmentContext, names: Sequence[str]) -> tuple[CheckResult, ...]:
+    """Return optional harness facts, leaving requirements to own their checks."""
+    results: list[CheckResult] = []
+    for name in names:
+        executable = context.executable_finder(name)
+        results.append(CheckResult(
+            id=name,
+            label=name.title(),
+            status=RequirementStatus.OK if executable else RequirementStatus.MISSING,
+            detail=executable or "not found in PATH",
+            required=False,
+        ))
+    return tuple(results)
+
+
+def ai_memory_data_dir(context: EnvironmentContext) -> Path:
+    """Use the native default while respecting an explicit local override."""
+    configured = os.environ.get("AI_MEMORY_DATA_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    if context.system.lower() == "darwin":
+        return context.home / "Library" / "Application Support" / "ai-memory"
+    if context.system.lower() == "windows":
+        return Path(os.environ.get("LOCALAPPDATA", str(context.home / "AppData" / "Local"))) / "ai-memory"
+    return Path(os.environ.get("XDG_DATA_HOME", str(context.home / ".local" / "share"))) / "ai-memory"
+
+
+def safe_file_contains(path: Path, value: str) -> bool:
+    """Check a capability marker without returning user-owned config content."""
+    try:
+        return path.is_file() and value.lower() in path.read_text(encoding="utf-8").lower()
+    except (OSError, UnicodeError):
+        return False
+
+
+class AiMemoryRequirement(EnvironmentRequirement):
+    """Diagnose native ai-memory health and supported harness capabilities."""
+
+    id = "ai-memory"
+    name = "ai-memory"
+    description = "Local memory binary, service, and harness integrations"
+
+    def __init__(self, harnesses: Sequence[str]) -> None:
+        self.harnesses = tuple(harnesses)
+
+    def diagnose(self, context: EnvironmentContext, platform: PlatformInfo) -> RequirementResult:
+        binary = self._binary(context)
+        checks: list[CheckResult] = []
+        if binary is None:
+            checks.append(CheckResult("binary", "binary", RequirementStatus.MISSING, "not found"))
+            checks.append(CheckResult("initialized", "initialized", RequirementStatus.MISSING, "binary unavailable"))
+            checks.append(CheckResult("service", "service", RequirementStatus.MISSING, "binary unavailable"))
+            checks.extend(self._integration_checks(context, available=False))
+            actions = self._missing_actions(platform)
+            return RequirementResult(
+                id=self.id,
+                name=self.name,
+                description=self.description,
+                required=True,
+                status=requirement_status(checks),
+                checks=tuple(checks),
+                actions=actions,
+            )
+
+        version = command_version(context, binary)
+        checks.append(CheckResult(
+            "binary",
+            "binary",
+            RequirementStatus.OK if version else RequirementStatus.ERROR,
+            binary,
+        ))
+        checks.append(self._initialized_check(context))
+        checks.extend(self._service_checks(context, binary))
+        checks.extend(self._integration_checks(context, available=True))
+        actions = self._repair_actions(context, platform, checks)
+        return RequirementResult(
+            id=self.id,
+            name=self.name,
+            description=self.description,
+            required=True,
+            status=requirement_status(checks),
+            checks=tuple(checks),
+            actions=actions,
+            version=version,
+        )
+
+    def _binary(self, context: EnvironmentContext) -> str | None:
+        found = context.executable_finder("ai-memory")
+        canonical = context.home / "Applications" / "ai-memory" / "ai-memory"
+        if canonical.is_file() and os.access(canonical, os.X_OK):
+            return str(canonical)
+        return found
+
+    def _initialized_check(self, context: EnvironmentContext) -> CheckResult:
+        data_dir = ai_memory_data_dir(context)
+        initialized = (data_dir / "config.toml").is_file()
+        return CheckResult(
+            "initialized",
+            "initialized",
+            RequirementStatus.OK if initialized else RequirementStatus.MISSING,
+            str(data_dir) if initialized else "data configuration missing",
+        )
+
+    def _service_checks(self, context: EnvironmentContext, binary: str) -> tuple[CheckResult, ...]:
+        status = context.runner.run((binary, "status"))
+        status_output = (status.stdout + "\n" + status.stderr).lower()
+        if status.succeeded:
+            cli = CheckResult("cli", "CLI status", RequirementStatus.OK, "communicating")
+        elif status.error or status.timed_out:
+            cli = CheckResult("cli", "CLI status", RequirementStatus.ERROR, status.error or "timed out")
+        elif any(token in status_output for token in ("not initialized", "data directory", "config.toml")):
+            cli = CheckResult("cli", "CLI status", RequirementStatus.MISSING, "not initialized")
+        else:
+            cli = CheckResult("cli", "CLI status", RequirementStatus.NOT_RUNNING, "server unavailable")
+        return (*self._launchd_checks(context), self._http_check(context), cli)
+
+    def _launchd_checks(self, context: EnvironmentContext) -> tuple[CheckResult, ...]:
+        if context.system.lower() != "darwin":
+            return (CheckResult(
+                "launchd",
+                "launchd",
+                RequirementStatus.UNSUPPORTED,
+                "not applicable outside macOS",
+                required=False,
+            ),)
+        launchctl = context.executable_finder("launchctl") or "launchctl"
+        domain = f"gui/{os.getuid()}/{AI_MEMORY_LABEL}"
+        result = context.runner.run((launchctl, "print", domain))
+        if result.succeeded and "state = running" in result.stdout.lower():
+            return (CheckResult("launchd", "launchd", RequirementStatus.OK, "running"),)
+        if result.succeeded:
+            return (CheckResult("launchd", "launchd", RequirementStatus.NOT_RUNNING, "registered but not running"),)
+        if result.error or result.timed_out:
+            return (CheckResult("launchd", "launchd", RequirementStatus.ERROR, result.error or "timed out"),)
+        return (CheckResult("launchd", "launchd", RequirementStatus.MISSING, "not registered"),)
+
+    def _http_check(self, context: EnvironmentContext) -> CheckResult:
+        curl = context.executable_finder("curl")
+        if not curl:
+            return CheckResult("http", "HTTP server", RequirementStatus.ERROR, "curl unavailable")
+        result = context.runner.run((
+            curl, "--silent", "--show-error", "--output", os.devnull,
+            "--write-out", "%{http_code}", AI_MEMORY_HTTP_URL,
+        ))
+        code = result.stdout.strip()
+        if code in {"200", "401", "405"}:
+            return CheckResult("http", "HTTP server", RequirementStatus.OK, f"HTTP {code}")
+        if result.error or result.timed_out:
+            return CheckResult("http", "HTTP server", RequirementStatus.ERROR, result.error or "timed out")
+        return CheckResult("http", "HTTP server", RequirementStatus.NOT_RUNNING, f"HTTP {code or 'unavailable'}")
+
+    def _integration_checks(self, context: EnvironmentContext, *, available: bool) -> tuple[CheckResult, ...]:
+        checks: list[CheckResult] = []
+        for harness in self.harnesses:
+            executable = context.executable_finder(harness)
+            if not executable:
+                continue
+            if not available:
+                checks.append(CheckResult(
+                    f"{harness}-mcp", f"{harness.title()} MCP", RequirementStatus.MISSING, "ai-memory unavailable",
+                ))
+                if harness != "copilot":
+                    checks.append(CheckResult(
+                        f"{harness}-hooks", f"{harness.title()} hooks", RequirementStatus.MISSING, "ai-memory unavailable",
+                    ))
+                continue
+            checks.extend(self._harness_checks(context, harness))
+        return tuple(checks)
+
+    def _harness_checks(self, context: EnvironmentContext, harness: str) -> tuple[CheckResult, ...]:
+        if harness == "codex":
+            config = context.home / ".codex" / "config.toml"
+            mcp = safe_file_contains(config, "[mcp_servers.ai-memory]")
+            hooks = safe_file_contains(config, "ai-memory") and safe_file_contains(config, "hook")
+            return (
+                CheckResult("codex-mcp", "Codex MCP", RequirementStatus.OK if mcp else RequirementStatus.MISSING, "configured" if mcp else "missing"),
+                CheckResult("codex-hooks", "Codex hooks", RequirementStatus.OK if hooks else RequirementStatus.MISSING, "configured" if hooks else "missing"),
+            )
+        if harness == "opencode":
+            config = context.home / ".config" / "opencode" / "opencode.json"
+            plugin = context.home / ".config" / "opencode" / "plugins" / "ai-memory.ts"
+            mcp = safe_file_contains(config, "ai-memory")
+            hooks = safe_file_contains(plugin, "ai-memory")
+            return (
+                CheckResult("opencode-mcp", "OpenCode MCP", RequirementStatus.OK if mcp else RequirementStatus.MISSING, "configured" if mcp else "missing"),
+                CheckResult("opencode-hooks", "OpenCode lifecycle", RequirementStatus.OK if hooks else RequirementStatus.MISSING, "configured" if hooks else "missing"),
+            )
+        if harness == "copilot":
+            config = context.root / ".vscode" / "mcp.json"
+            mcp = safe_file_contains(config, "ai-memory")
+            return (
+                CheckResult("copilot-mcp", "Copilot MCP", RequirementStatus.OK if mcp else RequirementStatus.MISSING, "configured" if mcp else "missing"),
+                CheckResult("copilot-hooks", "Copilot hooks", RequirementStatus.UNSUPPORTED, "MCP only", required=False),
+            )
+        return ()
+
+    def _missing_actions(self, platform: PlatformInfo) -> tuple[RepairAction, ...]:
+        if platform.system.lower() != "darwin":
+            return ()
+        if architecture_artifact(platform.architecture) is None:
+            return ()
+        return (RepairAction(
+            "ai-memory:install",
+            "Download ai-memory from akitaonrails/ai-memory and configure its LaunchAgent",
+            self.id,
+        ),)
+
+    def _repair_actions(
+        self,
+        context: EnvironmentContext,
+        platform: PlatformInfo,
+        checks: Sequence[CheckResult],
+    ) -> tuple[RepairAction, ...]:
+        by_id = {check.id: check for check in checks}
+        actions: list[RepairAction] = []
+        if platform.system.lower() == "darwin" and any(
+            by_id[name].status != RequirementStatus.OK
+            for name in ("launchd", "http", "cli")
+            if name in by_id
+        ):
+            actions.append(RepairAction(
+                "ai-memory:service",
+                "Repair ai-memory LaunchAgent and local service",
+                self.id,
+            ))
+        for harness in ("codex", "opencode", "copilot"):
+            if f"{harness}-mcp" in by_id and by_id[f"{harness}-mcp"].status != RequirementStatus.OK:
+                actions.append(RepairAction(
+                    f"ai-memory:{harness}-mcp",
+                    f"Configure ai-memory MCP for {harness.title()}",
+                    self.id,
+                ))
+            if harness != "copilot" and f"{harness}-hooks" in by_id and by_id[f"{harness}-hooks"].status != RequirementStatus.OK:
+                actions.append(RepairAction(
+                    f"ai-memory:{harness}-hooks",
+                    f"Configure ai-memory lifecycle integration for {harness.title()}",
+                    self.id,
+                ))
+        return tuple(actions)
+
+
+def architecture_artifact(architecture: str) -> str | None:
+    """Translate macOS architecture facts to the official release suffix."""
+    normalized = architecture.lower()
+    if normalized in {"arm64", "aarch64"}:
+        return "aarch64"
+    if normalized == "x86_64":
+        return "x86_64"
+    return None

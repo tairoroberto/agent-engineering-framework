@@ -113,6 +113,7 @@ T5 -> T6 -> T7
 **Requirement**: ENV-04
 **Tests**: documentation validation
 **Gate**: build
+**Status**: Complete
 
 ### T7: Document Portuguese diagnosis and repair workflows
 

@@ -16,6 +16,7 @@ Framework owns how agents cooperate. A project owns architecture, commands, rele
 /path/to/agent-engineering-framework/bin/agent-kit install
 /path/to/agent-engineering-framework/bin/agent-kit doctor
 /path/to/agent-engineering-framework/bin/agent-kit sync
+/path/to/agent-engineering-framework/bin/agent-kit env --check
 ```
 
 `init` creates `.agent-framework.toml`, copies lazy-load assets to `.agent-managed/agent-engineering-framework/`, backs up AGENTS.md once, and adds only its marker block. When ai-memory is enabled it creates `.ai-memory.toml` only when absent; that file becomes project-owned immediately and is thereafter preserved byte for byte. `sync` uses the same idempotent bootstrap.
@@ -27,7 +28,7 @@ In an interactive `init`, the CLI also offers `Adicionar agent-kit ao PATH ...? 
 `sync` also installs discoverable adapters for OpenCode (`.opencode`), Codex (`.codex`), GitHub Copilot (`.github/agents`, instructions and prompts), and Claude Code (`.claude/agents` and commands). These define roles, bounded capabilities, compact-context loading, and harness-local model mechanics. Existing files are backed up on adoption. Later manual edits to a managed adapter are diagnosed instead of silently overwritten. A project with audited harness-specific state/gate adapters may declare `[harness] managed_adapters = false` and keep that override local.
 If a framework-owned adapter must be restored, `agent-kit sync --replace-managed` first creates a timestamp-free managed backup and then restores only that managed file; it never alters project rules or source.
 
-`install` registers the framework home in user configuration, never in a consumer repository. `status` reports selected profile/protocol/registry. `diff` is read-only and reports whether managed assets or routing block would change. Managed project-local assets are intentional: current Codex/OpenCode discovery differs, while one agent-kit-generated copy gives both harnesses the same protocol without hard-coded consumer paths or manual copies.
+`install` registers the framework home in user configuration, never in a consumer repository. `status` reports selected profile/protocol/registry. `diff` is read-only and reports whether managed assets or routing block would change. `env --check` is also read-only: it diagnoses Node.js/npm/npx, ai-memory, Caveman, TLC Spec-Driven, and available harness integrations. Plain `env` previews only known repairs and asks for approval; `env --yes` applies that preview non-interactively. `env --json` emits a structured read-only report and cannot be combined with `--yes`. Managed project-local assets are intentional: current Codex/OpenCode discovery differs, while one agent-kit-generated copy gives both harnesses the same protocol without hard-coded consumer paths or manual copies.
 
 For formal feature tasks, the shared router derives a portable capability class
 from declared metadata, valid persisted classification, or deterministic
@@ -117,7 +118,7 @@ Add `profiles/<name>.md` only for reusable technology discovery and validation. 
 
 ## Troubleshooting
 
-Run `agent-kit doctor`. It reports incompatible majors, malformed/missing AGENTS markers, modified managed files, unavailable profile assets, absent ai-memory configuration, and whether the requested harness executable is on PATH. It never installs tools or rewrites project-owned content. `agent-kit sync` repairs only framework-owned managed assets and its marker block.
+Run `agent-kit doctor` for project installation integrity. Run `agent-kit env --check` for local prerequisites; it exits 0 only when required dependencies are ready and 1 when attention is required. It never installs Node.js. ai-memory automatic repair is available only on macOS and uses its fixed official release route after explicit approval; other platforms remain detection-only. Copilot receives ai-memory MCP configuration only, not lifecycle hooks. `agent-kit sync` repairs only framework-owned managed assets and its marker block.
 
 ## Upgrades and teams
 

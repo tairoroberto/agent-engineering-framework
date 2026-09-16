@@ -139,6 +139,31 @@ class EnvironmentRuntimeTest(unittest.TestCase):
         self.assertEqual("RuntimeError", report.requirements[0].checks[0].detail)
         self.assertEqual(environment.RequirementStatus.OK, report.requirements[1].status)
 
+    def test_process_timeout_becomes_error_without_stopping_other_requirements(self) -> None:
+        runner = FakeRunner({
+            ("/bin/ai-memory", "--version"): environment.CommandResult(
+                ("/bin/ai-memory", "--version"), None, timed_out=True, error="timed out after 10s",
+            ),
+        })
+        context = environment.EnvironmentContext(
+            root=Path("/workspace"), home=Path("/home/tester"), runner=runner,
+            system="Darwin", architecture="arm64",
+            executable_finder=lambda name: "/bin/ai-memory" if name == "ai-memory" else None,
+        )
+        report = environment.EnvironmentService(
+            context,
+            (environment.AiMemoryRequirement(()), StaticRequirement(self.result("healthy", environment.RequirementStatus.OK))),
+        ).inspect()
+
+        self.assertEqual(environment.RequirementStatus.ERROR, report.requirements[0].status)
+        self.assertEqual(environment.RequirementStatus.OK, report.requirements[1].status)
+
+    def test_subprocess_runner_captures_an_os_error(self) -> None:
+        result = environment.SubprocessRunner().run(("/definitely/missing/agent-kit-command",))
+
+        self.assertIsNone(result.returncode)
+        self.assertIsNotNone(result.error)
+
     def test_platform_collects_node_tools_independently(self) -> None:
         runner = FakeRunner({
             ("/bin/node", "--version"): environment.CommandResult(("/bin/node", "--version"), 0, stdout="v22.0.0\n"),
@@ -399,6 +424,69 @@ class EnvironmentRuntimeTest(unittest.TestCase):
         self.assertFalse(operation.succeeded)
         self.assertIn("unsupported architecture", operation.detail or "")
         self.assertFalse(runner.calls)
+
+    def test_invalid_release_archive_preserves_the_existing_canonical_installation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            binary = home / "Applications" / "ai-memory" / "ai-memory"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("known-good\n", encoding="utf-8")
+            runner = FakeRunner({})
+
+            def run(argv: tuple[str, ...], *, timeout: float = 10) -> environment.CommandResult:
+                normalized = tuple(argv)
+                runner.calls.append(normalized)
+                if normalized[0] in {"/bin/curl", "/bin/tar"}:
+                    return environment.CommandResult(normalized, 0)
+                return environment.CommandResult(normalized, 127, error="unexpected command")
+
+            runner.run = run  # type: ignore[assignment]
+            context = environment.EnvironmentContext(
+                root=Path(raw) / "project", home=home, runner=runner,
+                system="Darwin", architecture="arm64",
+                executable_finder=lambda name: {"curl": "/bin/curl", "tar": "/bin/tar"}.get(name),
+            )
+
+            operation = environment.AiMemoryRequirement(())._install_macos(
+                context, environment.PlatformInfo("Darwin", "arm64"),
+            )
+
+            self.assertFalse(operation.succeeded)
+            self.assertIn("release archive lacks", operation.detail or "")
+            self.assertEqual(b"known-good\n", binary.read_bytes())
+            self.assertFalse(any(command[1:2] == ("init",) for command in runner.calls))
+
+    def test_registered_launch_agent_is_booted_out_once_before_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            binary = home / "Applications" / "ai-memory" / "ai-memory"
+            template = binary.parent / "packaging" / "launchd" / environment.AI_MEMORY_LAUNCH_AGENT
+            template.parent.mkdir(parents=True)
+            binary.write_text("binary\n", encoding="utf-8")
+            template.write_text("__AI_MEMORY_BIN__\n__HOME__\n", encoding="utf-8")
+            domain = f"gui/{environment.os.getuid()}"
+            label = f"{domain}/{environment.AI_MEMORY_LABEL}"
+            runner = FakeRunner({
+                ("/bin/launchctl", "print", label): environment.CommandResult(("/bin/launchctl", "print", label), 0, stdout="state = running\n"),
+                ("/bin/launchctl", "bootout", label): environment.CommandResult(("/bin/launchctl", "bootout", label), 0),
+                ("/bin/launchctl", "bootstrap", domain, str(home / "Library" / "LaunchAgents" / environment.AI_MEMORY_LAUNCH_AGENT)): environment.CommandResult(("/bin/launchctl", "bootstrap", domain, str(home / "Library" / "LaunchAgents" / environment.AI_MEMORY_LAUNCH_AGENT)), 0),
+            })
+            context = environment.EnvironmentContext(
+                root=home, home=home, runner=runner, system="Darwin", architecture="arm64",
+                executable_finder=lambda name: "/bin/launchctl" if name == "launchctl" else None,
+            )
+
+            operation = environment.AiMemoryRequirement(())._configure_launchd(context, str(binary))
+
+            self.assertTrue(operation.succeeded)
+            self.assertEqual(
+                [
+                    ("/bin/launchctl", "print", label),
+                    ("/bin/launchctl", "bootout", label),
+                    ("/bin/launchctl", "bootstrap", domain, str(home / "Library" / "LaunchAgents" / environment.AI_MEMORY_LAUNCH_AGENT)),
+                ],
+                runner.calls,
+            )
 
     def test_caveman_missing_offers_the_official_global_install_command(self) -> None:
         runner = FakeRunner({

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import pty
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -1088,6 +1089,51 @@ class AgentKitTest(unittest.TestCase):
             self.assertEqual(2, conflict.returncode)
             self.assertIn("cannot be combined", conflict.stderr)
             self.assertFalse((home / "Applications").exists())
+
+    def test_env_yes_rechecks_and_continues_after_an_independent_skill_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            root = base / "consumer"
+            home = base / "home"
+            fake_bin = base / "bin"
+            root.mkdir()
+            home.mkdir()
+            fake_bin.mkdir()
+            self.prepare_healthy_env(root, home, fake_bin)
+            shutil.rmtree(home / ".agents" / "skills" / "caveman")
+            shutil.rmtree(home / ".agents" / "skills" / "tlc-spec-driven")
+            self.write_fake_executable(
+                fake_bin,
+                "npx",
+                "if [ \"$1\" = \"--version\" ]; then\n"
+                "  echo 11.0.0\n"
+                "elif [ \"$1\" = \"--no-install\" ]; then\n"
+                "  if [ -d \"$HOME/.agents/skills/caveman\" ]; then echo caveman; else echo other-skill; fi\n"
+                "  exit 0\n"
+                "elif [ \"$1\" = \"skills\" ]; then\n"
+                "  echo \"$*\" >> \"$HOME/npx-calls\"\n"
+                "  /bin/mkdir -p \"$HOME/.agents/skills/caveman\"\n"
+                "  printf '%s\\n' '---' 'name: caveman' '---' > \"$HOME/.agents/skills/caveman/SKILL.md\"\n"
+                "  exit 0\n"
+                "elif [ \"$1\" = \"@tech-leads-club/agent-skills\" ]; then\n"
+                "  echo \"$*\" >> \"$HOME/npx-calls\"\n"
+                "  exit 1\n"
+                "fi\n",
+            )
+            env = {**os.environ, "HOME": str(home), "PATH": f"{fake_bin}:/usr/bin"}
+
+            first = self.run_cli(root, "env", "--yes", env=env, check=False)
+            second = self.run_cli(root, "env", "--yes", env=env, check=False)
+
+            self.assertEqual(1, first.returncode)
+            self.assertTrue((home / ".agents" / "skills" / "caveman" / "SKILL.md").is_file())
+            self.assertIn("caveman:install: OK", first.stdout)
+            self.assertIn("tlc-spec-driven:install: ERROR", first.stdout)
+            self.assertIn("caveman: OK", first.stdout)
+            self.assertEqual(1, second.returncode)
+            calls = (home / "npx-calls").read_text(encoding="utf-8")
+            self.assertEqual(1, calls.count("skills add JuliusBrussee/caveman -g"))
+            self.assertEqual(2, calls.count("@tech-leads-club/agent-skills install -s tlc-spec-driven -g"))
 
     def prepare_healthy_env(self, root: Path, home: Path, fake_bin: Path) -> None:
         for name, body in {

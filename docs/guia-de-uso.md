@@ -125,7 +125,69 @@ agent-kit install
 
 Depois reinicie a sessão do Codex para carregar os prompts globais.
 
-### 3.3 Iniciar uma feature
+### 3.3 Diagnosticar e reparar o ambiente local
+
+Use este diagnóstico antes de atribuir um problema ao projeto. Ele verifica
+Node.js, npm, npx, ai-memory, Caveman, TLC Spec-Driven e as integrações dos
+harnesses encontradas no PATH:
+
+```bash
+agent-kit env --check
+```
+
+`--check` nunca instala, configura ou inicia serviços. A saída é `0` quando
+todas as dependências obrigatórias estão prontas e `1` quando há pendência.
+Para automação de inventário, use a mesma checagem em formato estruturado:
+
+```bash
+agent-kit env --check --json
+```
+
+`--json` também é somente leitura e não pode ser combinado com `--yes`.
+Erros internos ou uso inválido de flags retornam `2`.
+
+Quando houver uma ação conhecida e segura, rode o comando sem flag em um
+terminal interativo. Ele mostra o plano antes de qualquer download, instalação
+ou alteração de configuração:
+
+```bash
+agent-kit env
+# revise PLANNED CHANGES
+# responda y somente se quiser aplicar o plano
+```
+
+Para uma automação já revisada, use:
+
+```bash
+agent-kit env --yes
+```
+
+O comando só executa rotas oficiais fixas. Ele não instala Node.js, não usa
+`curl | sh`, não avalia conteúdo baixado como shell e não aceita URLs
+informadas pelo usuário. Reexecutar o mesmo plano é seguro: serviços são
+recarregados sem duplicar o LaunchAgent, e instaladores de skills precisam
+validar o resultado antes de serem reportados como concluídos.
+
+No macOS, um ai-memory ausente pode ser instalado da release oficial para a
+arquitetura `arm64`/`aarch64` ou `x86_64`, inicializado e registrado como
+LaunchAgent. `ai-memory init` prepara os dados; o LaunchAgent é a etapa que
+inicia o serviço. Em Linux e Windows, o comando diagnostica ai-memory, mas não
+faz instalação automática.
+
+As integrações de ai-memory seguem a capacidade de cada harness:
+
+- Codex: MCP e hooks.
+- OpenCode: MCP e plugin de ciclo de vida.
+- Copilot: somente MCP em `.vscode/mcp.json`; hooks não são suportados.
+
+Caveman é verificado pelo CLI oficial quando disponível e por diretórios
+globais conhecidos. TLC Spec-Driven só é aceito como instalado quando a origem
+oficial `tech-leads-club/agent-skills` também pode ser verificada; uma skill de
+nome parecido ou copiada sem origem não é tratada como sucesso. Se Node.js,
+npm ou npx estiver ausente, instale-os fora do `agent-kit` e execute
+`agent-kit env --check` novamente.
+
+### 3.4 Iniciar uma feature
 
 No OpenCode:
 
@@ -494,6 +556,7 @@ o plano.
 ```bash
 agent-kit status
 agent-kit doctor
+agent-kit env --check
 agent-kit diff
 agent-kit tasks list
 agent-kit catalog show

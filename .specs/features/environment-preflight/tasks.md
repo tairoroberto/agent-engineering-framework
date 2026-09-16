@@ -102,6 +102,7 @@ T5 -> T6 -> T7
 **Requirement**: ENV-01, ENV-04, ENV-05
 **Tests**: integration
 **Gate**: full
+**Status**: Complete
 
 ### T6: Document the concise command reference
 

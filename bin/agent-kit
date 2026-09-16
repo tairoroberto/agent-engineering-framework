@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import re
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,6 +27,7 @@ if str(STATE_DIR) not in sys.path:
     sys.path.insert(0, str(STATE_DIR))
 import catalog as model_catalog  # noqa: E402
 import activity as activity_runtime  # noqa: E402
+import environment as environment_runtime  # noqa: E402
 
 VERSION = (FRAMEWORK / "VERSION").read_text(encoding="utf-8").strip()
 MAJOR = VERSION.split(".", 1)[0]
@@ -1477,6 +1479,101 @@ def command_status(args: argparse.Namespace) -> None:
     print(f"REGISTRY: {'present' if registry.is_file() else 'missing'}")
 
 
+def environment_requirements() -> tuple[environment_runtime.EnvironmentRequirement, ...]:
+    """Keep the extensible environment registry at the CLI boundary."""
+    return (
+        environment_runtime.NodeToolingRequirement(),
+        environment_runtime.AiMemoryRequirement(SUPPORTED_HARNESSES),
+        environment_runtime.CavemanRequirement(SUPPORTED_HARNESSES),
+        environment_runtime.TlcSpecDrivenRequirement(SUPPORTED_HARNESSES),
+    )
+
+
+def render_environment_report(report: environment_runtime.EnvironmentReport) -> str:
+    """Render a compact, secret-free report for interactive terminal use."""
+    lines = [
+        "AGENT KIT ENVIRONMENT",
+        f"PLATFORM: {report.platform.system} {report.platform.architecture}",
+        "NODE: " + "  ".join((
+            f"node={report.platform.node_version or 'missing'}",
+            f"npm={report.platform.npm_version or 'missing'}",
+            f"npx={report.platform.npx_version or 'missing'}",
+        )),
+    ]
+    if report.harnesses:
+        lines.append("HARNESS: " + "  ".join(
+            f"{harness.id}={harness.status.value.upper()}"
+            for harness in report.harnesses
+        ))
+    for requirement in report.requirements:
+        version = f" version={requirement.version}" if requirement.version else ""
+        lines.append(f"{requirement.name}: {requirement.status.value.upper()}{version}")
+        for check in requirement.checks:
+            qualifier = " optional" if not check.required else ""
+            detail = f" ({check.detail})" if check.detail else ""
+            lines.append(f"  - {check.label}: {check.status.value.upper()}{qualifier}{detail}")
+    if report.operations:
+        lines.append("OPERATIONS:")
+        for operation in report.operations:
+            detail = f" ({operation.detail})" if operation.detail else ""
+            outcome = "OK" if operation.succeeded else "ERROR"
+            lines.append(f"  - {operation.action_id}: {outcome}{detail}")
+    lines.append("ENVIRONMENT: READY" if report.healthy else "ENVIRONMENT: ATTENTION REQUIRED")
+    return "\n".join(lines)
+
+
+def render_environment_actions(actions: tuple[environment_runtime.RepairAction, ...]) -> str:
+    """Show every pre-authorized action before a repair may start."""
+    lines = ["PLANNED CHANGES:"]
+    lines.extend(f"- {action.description}" for action in actions)
+    return "\n".join(lines)
+
+
+def command_env(args: argparse.Namespace) -> None:
+    """Diagnose local prerequisites and repair only explicitly approved actions."""
+    if args.json and args.yes:
+        fail("env --json cannot be combined with --yes because JSON never changes the environment")
+    root = Path(args.root).resolve()
+    context = environment_runtime.EnvironmentContext.current(root)
+    service = environment_runtime.EnvironmentService(
+        context,
+        environment_requirements(),
+        harnesses=SUPPORTED_HARNESSES,
+    )
+    report = service.inspect()
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False, sort_keys=True))
+        if not report.healthy:
+            raise SystemExit(1)
+        return
+    print(render_environment_report(report))
+    if report.healthy:
+        return
+    if args.check:
+        raise SystemExit(1)
+    if not report.actions:
+        print("NO SAFE AUTOMATIC REPAIR: install missing prerequisites, then run agent-kit env --check.")
+        raise SystemExit(1)
+    print(render_environment_actions(report.actions))
+    approved = args.yes
+    if args.yes:
+        print("APPROVAL: --yes")
+    elif not sys.stdin.isatty():
+        print("INTERACTION_REQUIRED: review the planned changes and rerun with --yes to approve them.")
+        raise SystemExit(1)
+    else:
+        answer = input("Apply these changes? [y/N]: ").strip().lower()
+        approved = answer in {"y", "yes", "s", "sim"}
+    if not approved:
+        print("NO CHANGES MADE.")
+        raise SystemExit(1)
+    operations = service.repair(report)
+    report = replace(service.inspect(), operations=operations)
+    print(render_environment_report(report))
+    if not report.healthy:
+        raise SystemExit(1)
+
+
 def command_catalog(args: argparse.Namespace) -> None:
     root = Path(args.root).resolve()
     data = parse_manifest(root)
@@ -1743,6 +1840,12 @@ def main() -> None:
     install.set_defaults(func=command_install)
     status = sub.add_parser("status")
     status.set_defaults(func=command_status)
+    env = sub.add_parser("env", help="check and repair local agent dependencies")
+    env_mode = env.add_mutually_exclusive_group()
+    env_mode.add_argument("--check", action="store_true", help="report only; do not prompt or change the machine")
+    env_mode.add_argument("--yes", action="store_true", help="approve the displayed safe repair plan")
+    env.add_argument("--json", action="store_true", help="emit structured report only; never change the machine")
+    env.set_defaults(func=command_env)
     catalog = sub.add_parser("catalog")
     catalog_sub = catalog.add_subparsers(dest="catalog_command", required=True)
     catalog_refresh = catalog_sub.add_parser("refresh")

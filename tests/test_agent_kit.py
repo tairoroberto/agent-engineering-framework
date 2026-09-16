@@ -1028,6 +1028,113 @@ class AgentKitTest(unittest.TestCase):
             self.assertEqual(1, migrated["executionPolicy"]["maxNoProgressRounds"])
             self.assertIsNone(migrated["tasks"]["T1"]["convergence"]["developerClosure"])
 
+    def test_env_check_json_is_read_only_and_reports_a_healthy_setup(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            root = base / "consumer"
+            home = base / "home"
+            fake_bin = base / "bin"
+            root.mkdir()
+            home.mkdir()
+            fake_bin.mkdir()
+            self.prepare_healthy_env(root, home, fake_bin)
+            env = {**os.environ, "HOME": str(home), "PATH": f"{fake_bin}:/usr/bin"}
+            data_before = (home / "Library" / "Application Support" / "ai-memory" / "config.toml").read_bytes()
+            caveman_before = (home / ".agents" / "skills" / "caveman" / "SKILL.md").read_bytes()
+            tlc_before = (home / ".agents" / "skills" / "tlc-spec-driven" / ".skill-meta.json").read_bytes()
+
+            first = self.run_cli(root, "env", "--check", "--json", env=env)
+            second = self.run_cli(root, "env", "--yes", env=env)
+
+            report = json.loads(first.stdout)
+            self.assertTrue(report["healthy"])
+            self.assertEqual(["node-tooling", "ai-memory", "caveman", "tlc-spec-driven"], [
+                item["id"] for item in report["requirements"]
+            ])
+            self.assertIn("ENVIRONMENT: READY", second.stdout)
+            self.assertFalse((home / "Applications").exists())
+            self.assertEqual(data_before, (home / "Library" / "Application Support" / "ai-memory" / "config.toml").read_bytes())
+            self.assertEqual(caveman_before, (home / ".agents" / "skills" / "caveman" / "SKILL.md").read_bytes())
+            self.assertEqual(tlc_before, (home / ".agents" / "skills" / "tlc-spec-driven" / ".skill-meta.json").read_bytes())
+
+    def test_env_decline_and_json_yes_conflict_do_not_change_the_machine(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            root = base / "consumer"
+            home = base / "home"
+            fake_bin = base / "bin"
+            root.mkdir()
+            home.mkdir()
+            fake_bin.mkdir()
+            for name, body in {
+                "node": "echo v22.0.0\n",
+                "npm": "echo 10.0.0\n",
+                "npx": "if [ \"$1\" = \"--version\" ]; then echo 11.0.0; else exit 0; fi\n",
+            }.items():
+                self.write_fake_executable(fake_bin, name, body)
+            env = {**os.environ, "HOME": str(home), "PATH": f"{fake_bin}:/usr/bin"}
+
+            checked = self.run_cli(root, "env", "--check", env=env, check=False)
+            declined = self.run_cli_tty(root, "env", response="\n", env=env, check=False)
+            conflict = self.run_cli(root, "env", "--yes", "--json", env=env, check=False)
+
+            self.assertEqual(1, checked.returncode)
+            self.assertNotIn("PLANNED CHANGES:", checked.stdout)
+            self.assertEqual(1, declined.returncode)
+            self.assertIn("PLANNED CHANGES:", declined.stdout)
+            self.assertIn("NO CHANGES MADE.", declined.stdout)
+            self.assertEqual(2, conflict.returncode)
+            self.assertIn("cannot be combined", conflict.stderr)
+            self.assertFalse((home / "Applications").exists())
+
+    def prepare_healthy_env(self, root: Path, home: Path, fake_bin: Path) -> None:
+        for name, body in {
+            "node": "echo v22.0.0\n",
+            "npm": "echo 10.0.0\n",
+            "npx": (
+                "if [ \"$1\" = \"--version\" ]; then echo 11.0.0; "
+                "elif [ \"$1\" = \"--no-install\" ]; then echo caveman; fi\n"
+            ),
+            "ai-memory": "if [ \"$1\" = \"--version\" ]; then echo 'ai-memory 2.1.0'; fi\n",
+            "launchctl": "echo 'state = running'\n",
+            "curl": "printf 405\n",
+            "codex": "exit 0\n",
+            "opencode": "exit 0\n",
+            "copilot": "exit 0\n",
+            "claude": "exit 0\n",
+        }.items():
+            self.write_fake_executable(fake_bin, name, body)
+        data = home / "Library" / "Application Support" / "ai-memory"
+        data.mkdir(parents=True)
+        (data / "config.toml").write_text("ready = true\n", encoding="utf-8")
+        codex = home / ".codex"
+        codex.mkdir()
+        (codex / "config.toml").write_text(
+            "[mcp_servers.ai-memory]\ncommand = 'ai-memory'\nhook = 'ai-memory'\n",
+            encoding="utf-8",
+        )
+        opencode = home / ".config" / "opencode"
+        (opencode / "plugins").mkdir(parents=True)
+        (opencode / "opencode.json").write_text('{"ai-memory": {}}\n', encoding="utf-8")
+        (opencode / "plugins" / "ai-memory.ts").write_text("ai-memory\n", encoding="utf-8")
+        mcp = root / ".vscode"
+        mcp.mkdir()
+        (mcp / "mcp.json").write_text('{"ai-memory": {}}\n', encoding="utf-8")
+        for skill_name, metadata in (
+            ("caveman", None),
+            ("tlc-spec-driven", '{"source": "tech-leads-club/agent-skills"}\n'),
+        ):
+            skill = home / ".agents" / "skills" / skill_name
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(f"---\nname: {skill_name}\n---\n", encoding="utf-8")
+            if metadata:
+                (skill / ".skill-meta.json").write_text(metadata, encoding="utf-8")
+
+    def write_fake_executable(self, directory: Path, name: str, body: str) -> None:
+        path = directory / name
+        path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+        path.chmod(0o755)
+
     def run_cli(
         self, root: Path, *args: str, check: bool = True,
         env: dict[str, str] | None = None,

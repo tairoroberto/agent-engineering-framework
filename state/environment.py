@@ -290,9 +290,16 @@ def command_version(context: EnvironmentContext, executable: str) -> str | None:
 class EnvironmentService:
     """Coordinates independent requirements while retaining partial evidence."""
 
-    def __init__(self, context: EnvironmentContext, requirements: Sequence[EnvironmentRequirement]) -> None:
+    def __init__(
+        self,
+        context: EnvironmentContext,
+        requirements: Sequence[EnvironmentRequirement],
+        *,
+        harnesses: Sequence[str] = (),
+    ) -> None:
         self.context = context
         self.requirements = tuple(requirements)
+        self.harnesses = tuple(harnesses)
 
     def inspect(self) -> EnvironmentReport:
         platform = inspect_platform(self.context)
@@ -314,7 +321,11 @@ class EnvironmentService:
                         detail=type(error).__name__,
                     ),),
                 ))
-        return EnvironmentReport(platform=platform, requirements=tuple(results))
+        return EnvironmentReport(
+            platform=platform,
+            requirements=tuple(results),
+            harnesses=detected_harnesses(self.context, self.harnesses),
+        )
 
     def repair(self, report: EnvironmentReport) -> tuple[OperationResult, ...]:
         platform = report.platform
@@ -345,6 +356,35 @@ def inspect_platform(context: EnvironmentContext) -> PlatformInfo:
         npm_version=versions["npm"],
         npx_version=versions["npx"],
     )
+
+
+class NodeToolingRequirement(EnvironmentRequirement):
+    """Report the Node toolchain without attempting a system-level install."""
+
+    id = "node-tooling"
+    name = "Node.js toolchain"
+    description = "Node.js, npm, and npx required by globally managed skills"
+
+    def diagnose(self, context: EnvironmentContext, platform: PlatformInfo) -> RequirementResult:
+        versions = (
+            ("node", "Node.js", platform.node_version),
+            ("npm", "npm", platform.npm_version),
+            ("npx", "npx", platform.npx_version),
+        )
+        checks = tuple(CheckResult(
+            identifier,
+            label,
+            RequirementStatus.OK if version else RequirementStatus.MISSING,
+            version or "not found in PATH; install Node.js outside agent-kit",
+        ) for identifier, label, version in versions)
+        return RequirementResult(
+            id=self.id,
+            name=self.name,
+            description=self.description,
+            required=True,
+            status=requirement_status(checks),
+            checks=checks,
+        )
 
 
 AI_MEMORY_LABEL = "com.github.akitaonrails.ai-memory"
@@ -713,6 +753,8 @@ class AiMemoryRequirement(EnvironmentRequirement):
     def _configure_detected_integrations(self, context: EnvironmentContext, binary: str) -> tuple[OperationResult, ...]:
         operations: list[OperationResult] = []
         for harness in self.harnesses:
+            if harness not in {"codex", "opencode", "copilot"}:
+                continue
             if context.executable_finder(harness):
                 operations.append(self._configure_integration(context, binary, harness, "mcp"))
                 if harness != "copilot":
@@ -792,12 +834,17 @@ class GlobalSkillRequirement(EnvironmentRequirement):
 
     def diagnose(self, context: EnvironmentContext, platform: PlatformInfo) -> RequirementResult:
         npx = context.executable_finder("npx")
+        tooling = (
+            ("node", "Node.js", platform.node_version),
+            ("npm", "npm", platform.npm_version),
+            ("npx", "npx", platform.npx_version),
+        )
         checks: list[CheckResult] = [CheckResult(
-            "npx",
-            "npx",
-            RequirementStatus.OK if npx else RequirementStatus.MISSING,
-            "available" if npx else "Node.js/npm/npx required for skill installation",
-        )]
+            identifier,
+            label,
+            RequirementStatus.OK if version else RequirementStatus.MISSING,
+            version or "not found in PATH",
+        ) for identifier, label, version in tooling]
         cli_installed = False
         if npx and self.cli_listing_command:
             listing = context.runner.run((npx, *self.cli_listing_command))
@@ -823,7 +870,8 @@ class GlobalSkillRequirement(EnvironmentRequirement):
         if installed_status == RequirementStatus.OK:
             checks.extend(self._link_checks(context))
         actions: tuple[RepairAction, ...] = ()
-        if npx and any(check.status != RequirementStatus.OK for check in checks if check.required):
+        tooling_ready = all(version for _identifier, _label, version in tooling)
+        if npx and tooling_ready and any(check.status != RequirementStatus.OK for check in checks if check.required):
             actions = (RepairAction(
                 f"{self.id}:install",
                 self.install_description(),

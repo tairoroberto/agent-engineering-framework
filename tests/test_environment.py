@@ -160,6 +160,16 @@ class EnvironmentRuntimeTest(unittest.TestCase):
         self.assertIsNone(facts.npx_version)
         self.assertEqual([("/bin/node", "--version"), ("/bin/npm", "--version")], runner.calls)
 
+    def test_node_tooling_is_diagnosed_but_never_offers_a_system_install(self) -> None:
+        requirement = environment.NodeToolingRequirement()
+        result = requirement.diagnose(self.context(), environment.PlatformInfo("Darwin", "arm64", node_version="v22"))
+
+        self.assertEqual(environment.RequirementStatus.PARTIAL, result.status)
+        self.assertEqual((), result.actions)
+        self.assertEqual(environment.RequirementStatus.MISSING, next(
+            check.status for check in result.checks if check.id == "npm"
+        ))
+
     def test_ai_memory_missing_on_macos_offers_only_the_official_install_action(self) -> None:
         result = environment.AiMemoryRequirement(("codex",)).diagnose(
             self.context(), environment.PlatformInfo("Darwin", "arm64"),
@@ -325,7 +335,7 @@ class EnvironmentRuntimeTest(unittest.TestCase):
             root=Path("/workspace"), home=Path("/home/tester"), runner=runner,
             system="Darwin", architecture="arm64", executable_finder=lambda name: "/bin/npx" if name == "npx" else None,
         )
-        result = environment.CavemanRequirement(()).diagnose(context, environment.PlatformInfo("Darwin", "arm64", npx_version="11"))
+        result = environment.CavemanRequirement(()).diagnose(context, environment.PlatformInfo("Darwin", "arm64", node_version="v22", npm_version="10", npx_version="11"))
 
         self.assertEqual(environment.RequirementStatus.MISSING, result.status)
         self.assertEqual(("caveman:install",), tuple(action.id for action in result.actions))
@@ -341,7 +351,7 @@ class EnvironmentRuntimeTest(unittest.TestCase):
                 executable_finder=lambda name: {"npx": "/bin/npx", "codex": "/bin/codex"}.get(name),
             )
 
-            result = environment.CavemanRequirement(("codex",)).diagnose(context, environment.PlatformInfo("Darwin", "arm64", npx_version="11"))
+            result = environment.CavemanRequirement(("codex",)).diagnose(context, environment.PlatformInfo("Darwin", "arm64", node_version="v22", npm_version="10", npx_version="11"))
 
             self.assertEqual(environment.RequirementStatus.PARTIAL, result.status)
             self.assertEqual(environment.RequirementStatus.MISSING, next(check.status for check in result.checks if check.id == "codex-link"))
@@ -357,7 +367,7 @@ class EnvironmentRuntimeTest(unittest.TestCase):
                 executable_finder=lambda name: "/bin/npx" if name == "npx" else None,
             )
 
-            result = environment.TlcSpecDrivenRequirement(()).diagnose(context, environment.PlatformInfo("Darwin", "arm64", npx_version="11"))
+            result = environment.TlcSpecDrivenRequirement(()).diagnose(context, environment.PlatformInfo("Darwin", "arm64", node_version="v22", npm_version="10", npx_version="11"))
 
             self.assertEqual(environment.RequirementStatus.PARTIAL, result.status)
             self.assertEqual(("tlc-spec-driven:install",), tuple(action.id for action in result.actions))
@@ -393,7 +403,7 @@ class EnvironmentRuntimeTest(unittest.TestCase):
             )
 
             operation = environment.TlcSpecDrivenRequirement(()).repair(
-                context, environment.PlatformInfo("Darwin", "arm64", npx_version="11"),
+                context, environment.PlatformInfo("Darwin", "arm64", node_version="v22", npm_version="10", npx_version="11"),
                 {"tlc-spec-driven:install"},
             )[0]
 
@@ -413,7 +423,7 @@ class EnvironmentRuntimeTest(unittest.TestCase):
         )
 
         operation = environment.TlcSpecDrivenRequirement(()).repair(
-            context, environment.PlatformInfo("Darwin", "arm64", npx_version="11"),
+            context, environment.PlatformInfo("Darwin", "arm64", node_version="v22", npm_version="10", npx_version="11"),
             {"tlc-spec-driven:install"},
         )[0]
 
@@ -430,7 +440,7 @@ class EnvironmentRuntimeTest(unittest.TestCase):
         )
 
         operation = environment.CavemanRequirement(()).repair(
-            context, environment.PlatformInfo("Darwin", "arm64", npx_version="11"), {"caveman:install"},
+            context, environment.PlatformInfo("Darwin", "arm64", node_version="v22", npm_version="10", npx_version="11"), {"caveman:install"},
         )[0]
 
         self.assertFalse(operation.succeeded)
@@ -459,7 +469,7 @@ class EnvironmentRuntimeTest(unittest.TestCase):
             )
 
             operation = environment.CavemanRequirement(()).repair(
-                context, environment.PlatformInfo("Darwin", "arm64", npx_version="11"), {"caveman:install"},
+                context, environment.PlatformInfo("Darwin", "arm64", node_version="v22", npm_version="10", npx_version="11"), {"caveman:install"},
             )[0]
 
             self.assertTrue(operation.succeeded)

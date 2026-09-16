@@ -12,7 +12,7 @@ REQUIRED = {
     "profiles": ["generic.md", "flutter.md", "laravel.md", "kotlin-multiplatform.md"],
     "templates": ["agent-framework.toml", "agents-managed-block.md", "ai-memory.toml"],
     "docs": ["model-routing-and-installation.md", "guia-de-uso.md"],
-    "state": ["README.md", "schema.json", "state.py", "routing.py", "catalog.py", "activity.py", "validate_state.py"],
+    "state": ["README.md", "schema.json", "state.py", "routing.py", "catalog.py", "activity.py", "environment.py", "validate_state.py"],
     "workflows": ["manifest.toml", "continue.md", "feature.md", "review.md"],
     "skills/engineering-protocol": ["SKILL.md", "references/routing-policy.json"],
 }

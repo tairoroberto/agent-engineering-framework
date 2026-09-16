@@ -6,9 +6,9 @@ The framework currently validates a consumer project's managed assets, but it ca
 
 ## Goals
 
-- [ ] Provide one safe command that reports the machine, runtime dependencies, and supported harness integrations.
-- [ ] Repair only known, user-approved requirements and recheck the resulting environment.
-- [ ] Keep diagnosis usable in CI and scripts without modifying the machine.
+- [x] Provide one safe command that reports the machine, runtime dependencies, and supported harness integrations.
+- [x] Repair only known, user-approved requirements and recheck the resulting environment.
+- [x] Keep diagnosis usable in CI and scripts without modifying the machine.
 
 ## Out of Scope
 
@@ -112,20 +112,20 @@ The framework currently validates a consumer project's managed assets, but it ca
 
 | Requirement ID | Story | Phase | Status |
 | --- | --- | --- | --- |
-| ENV-01 | Diagnose a local environment | Implementing | Implementing |
-| ENV-02 | Diagnose a local environment | Implementing | Implementing |
-| ENV-03 | Diagnose a local environment | In Tasks | Pending |
-| ENV-04 | Repair known requirements with explicit consent | In Tasks | Pending |
-| ENV-05 | Repair known requirements with explicit consent | In Tasks | Pending |
-| ENV-06 | Install and repair ai-memory on macOS | In Tasks | Pending |
-| ENV-07 | Install and repair ai-memory on macOS | In Tasks | Pending |
-| ENV-08 | Install framework skills and harness integrations | In Tasks | Pending |
-| ENV-09 | Install framework skills and harness integrations | In Tasks | Pending |
+| ENV-01 | Diagnose a local environment | Execute | Implemented - verifier pending |
+| ENV-02 | Diagnose a local environment | Execute | Implemented - verifier pending |
+| ENV-03 | Diagnose a local environment | Execute | Implemented - verifier pending |
+| ENV-04 | Repair known requirements with explicit consent | Execute | Implemented - verifier pending |
+| ENV-05 | Repair known requirements with explicit consent | Execute | Implemented - verifier pending |
+| ENV-06 | Install and repair ai-memory on macOS | Execute | Implemented - verifier pending |
+| ENV-07 | Install and repair ai-memory on macOS | Execute | Implemented - verifier pending |
+| ENV-08 | Install framework skills and harness integrations | Execute | Implemented - verifier pending |
+| ENV-09 | Install framework skills and harness integrations | Execute | Implemented - verifier pending |
 
 **Coverage:** 9 total, 9 mapped to tasks, 0 unmapped.
 
 ## Success Criteria
 
-- [ ] `agent-kit env`, `agent-kit env --check`, `agent-kit env --yes`, and `agent-kit env --json` have deterministic behavior.
-- [ ] All direct process interactions are fakeable in tests, and no test installs a real dependency.
-- [ ] Existing Agent Kit commands retain their current behavior.
+- [x] `agent-kit env`, `agent-kit env --check`, `agent-kit env --yes`, and `agent-kit env --json` have deterministic behavior.
+- [x] All direct process interactions are fakeable in tests, and no test installs a real dependency.
+- [x] Existing Agent Kit commands retain their current behavior.

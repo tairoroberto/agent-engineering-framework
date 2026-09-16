@@ -317,6 +317,154 @@ class EnvironmentRuntimeTest(unittest.TestCase):
         self.assertIn("unsupported architecture", operation.detail or "")
         self.assertFalse(runner.calls)
 
+    def test_caveman_missing_offers_the_official_global_install_command(self) -> None:
+        runner = FakeRunner({
+            ("/bin/npx", "--no-install", "skills", "ls", "-g"): environment.CommandResult(("/bin/npx", "--no-install", "skills", "ls", "-g"), 0, stdout="other-skill\n"),
+        })
+        context = environment.EnvironmentContext(
+            root=Path("/workspace"), home=Path("/home/tester"), runner=runner,
+            system="Darwin", architecture="arm64", executable_finder=lambda name: "/bin/npx" if name == "npx" else None,
+        )
+        result = environment.CavemanRequirement(()).diagnose(context, environment.PlatformInfo("Darwin", "arm64", npx_version="11"))
+
+        self.assertEqual(environment.RequirementStatus.MISSING, result.status)
+        self.assertEqual(("caveman:install",), tuple(action.id for action in result.actions))
+
+    def test_caveman_global_skill_without_a_known_codex_link_is_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw)
+            skill = home / ".config" / "opencode" / "skills" / "caveman"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("---\nname: caveman\n---\n", encoding="utf-8")
+            context = environment.EnvironmentContext(
+                root=home, home=home, runner=FakeRunner({}), system="Darwin", architecture="arm64",
+                executable_finder=lambda name: {"npx": "/bin/npx", "codex": "/bin/codex"}.get(name),
+            )
+
+            result = environment.CavemanRequirement(("codex",)).diagnose(context, environment.PlatformInfo("Darwin", "arm64", npx_version="11"))
+
+            self.assertEqual(environment.RequirementStatus.PARTIAL, result.status)
+            self.assertEqual(environment.RequirementStatus.MISSING, next(check.status for check in result.checks if check.id == "codex-link"))
+
+    def test_tlc_skill_with_unverified_origin_is_partial_not_success(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw)
+            skill = home / ".agents" / "skills" / "tlc-spec-driven"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("---\nname: tlc-spec-driven\n---\n", encoding="utf-8")
+            context = environment.EnvironmentContext(
+                root=home, home=home, runner=FakeRunner({}), system="Darwin", architecture="arm64",
+                executable_finder=lambda name: "/bin/npx" if name == "npx" else None,
+            )
+
+            result = environment.TlcSpecDrivenRequirement(()).diagnose(context, environment.PlatformInfo("Darwin", "arm64", npx_version="11"))
+
+            self.assertEqual(environment.RequirementStatus.PARTIAL, result.status)
+            self.assertEqual(("tlc-spec-driven:install",), tuple(action.id for action in result.actions))
+
+    def test_tlc_install_rechecks_the_official_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw)
+            runner = FakeRunner({})
+            original_run = runner.run
+
+            def run(argv: tuple[str, ...], *, timeout: float = 10) -> environment.CommandResult:
+                normalized = tuple(argv)
+                if normalized == (
+                    "/bin/npx", "@tech-leads-club/agent-skills", "install",
+                    "-s", "tlc-spec-driven", "-g",
+                ):
+                    skill = home / ".agents" / "skills" / "tlc-spec-driven"
+                    skill.mkdir(parents=True)
+                    (skill / "SKILL.md").write_text(
+                        "---\nname: tlc-spec-driven\n---\n", encoding="utf-8",
+                    )
+                    (skill / ".skill-meta.json").write_text(
+                        '{"source": "tech-leads-club/agent-skills"}\n', encoding="utf-8",
+                    )
+                    runner.calls.append(normalized)
+                    return environment.CommandResult(normalized, 0)
+                return original_run(normalized, timeout=timeout)
+
+            runner.run = run  # type: ignore[assignment]
+            context = environment.EnvironmentContext(
+                root=home, home=home, runner=runner, system="Darwin", architecture="arm64",
+                executable_finder=lambda name: "/bin/npx" if name == "npx" else None,
+            )
+
+            operation = environment.TlcSpecDrivenRequirement(()).repair(
+                context, environment.PlatformInfo("Darwin", "arm64", npx_version="11"),
+                {"tlc-spec-driven:install"},
+            )[0]
+
+            self.assertTrue(operation.succeeded)
+            self.assertEqual("installed and verified", operation.detail)
+
+    def test_tlc_install_failure_is_reported(self) -> None:
+        command = (
+            "/bin/npx", "@tech-leads-club/agent-skills", "install",
+            "-s", "tlc-spec-driven", "-g",
+        )
+        runner = FakeRunner({command: environment.CommandResult(command, 1)})
+        context = environment.EnvironmentContext(
+            root=Path("/workspace"), home=Path("/home/tester"), runner=runner,
+            system="Darwin", architecture="arm64",
+            executable_finder=lambda name: "/bin/npx" if name == "npx" else None,
+        )
+
+        operation = environment.TlcSpecDrivenRequirement(()).repair(
+            context, environment.PlatformInfo("Darwin", "arm64", npx_version="11"),
+            {"tlc-spec-driven:install"},
+        )[0]
+
+        self.assertFalse(operation.succeeded)
+        self.assertEqual("command exited 1", operation.detail)
+
+    def test_skill_install_failure_is_retained_without_touching_other_requirements(self) -> None:
+        runner = FakeRunner({
+            ("/bin/npx", "skills", "add", "JuliusBrussee/caveman", "-g"): environment.CommandResult(("/bin/npx", "skills", "add", "JuliusBrussee/caveman", "-g"), 1),
+        })
+        context = environment.EnvironmentContext(
+            root=Path("/workspace"), home=Path("/home/tester"), runner=runner,
+            system="Darwin", architecture="arm64", executable_finder=lambda name: "/bin/npx" if name == "npx" else None,
+        )
+
+        operation = environment.CavemanRequirement(()).repair(
+            context, environment.PlatformInfo("Darwin", "arm64", npx_version="11"), {"caveman:install"},
+        )[0]
+
+        self.assertFalse(operation.succeeded)
+        self.assertEqual("command exited 1", operation.detail)
+
+    def test_successful_caveman_install_is_rechecked_from_the_global_skill_root(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw)
+            runner = FakeRunner({})
+            original_run = runner.run
+
+            def run(argv: tuple[str, ...], *, timeout: float = 10) -> environment.CommandResult:
+                normalized = tuple(argv)
+                if normalized == ("/bin/npx", "skills", "add", "JuliusBrussee/caveman", "-g"):
+                    skill = home / ".agents" / "skills" / "caveman"
+                    skill.mkdir(parents=True)
+                    (skill / "SKILL.md").write_text("---\nname: caveman\n---\n", encoding="utf-8")
+                    runner.calls.append(normalized)
+                    return environment.CommandResult(normalized, 0)
+                return original_run(normalized, timeout=timeout)
+
+            runner.run = run  # type: ignore[assignment]
+            context = environment.EnvironmentContext(
+                root=home, home=home, runner=runner, system="Darwin", architecture="arm64",
+                executable_finder=lambda name: "/bin/npx" if name == "npx" else None,
+            )
+
+            operation = environment.CavemanRequirement(()).repair(
+                context, environment.PlatformInfo("Darwin", "arm64", npx_version="11"), {"caveman:install"},
+            )[0]
+
+            self.assertTrue(operation.succeeded)
+            self.assertEqual("installed and verified", operation.detail)
+
 
 if __name__ == "__main__":
     unittest.main()

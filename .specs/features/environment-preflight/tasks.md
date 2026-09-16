@@ -9,17 +9,17 @@
 
 | Code Layer | Required Test Type | Coverage Expectation | Location Pattern | Run Command |
 | --- | --- | --- | --- | --- |
-| Environment runtime | unit | Every result state, action decision, platform branch, and failure path tied to ENV-01 through ENV-09 | `tests/test_environment.py` | `python3 -m unittest tests/test_environment.py` |
-| CLI adapter | integration | Text/JSON, approval, refusal, repeated execution, and exit-code behavior through the real CLI with fake executables | `tests/test_agent_kit.py` | `python3 -m unittest tests/test_agent_kit.py` |
+| Environment runtime | unit | Every result state, action decision, platform branch, and failure path tied to ENV-01 through ENV-09 | `tests/test_environment.py` | `python3 tests/test_environment.py` |
+| CLI adapter | integration | Text/JSON, approval, refusal, repeated execution, and exit-code behavior through the real CLI with fake executables | `tests/test_agent_kit.py` | `python3 tests/test_agent_kit.py` |
 | Documentation and structural registry | documentation validation | Commands and platform boundaries match parser behavior; framework structural gate passes | `README.md`, `docs/guia-de-uso.md`, `scripts/validate_framework.py` | `python3 scripts/validate_framework.py` |
 
 ## Gate Check Commands
 
 | Gate Level | When to Use | Command |
 | --- | --- | --- |
-| Quick | Runtime or CLI task | `python3 -m unittest tests/test_environment.py tests/test_agent_kit.py` |
-| Full | Last executable behavior phase | `python3 -m unittest` |
-| Build | Documentation or final integration | `python3 scripts/validate_framework.py && python3 -m unittest` |
+| Quick | Runtime or CLI task | `python3 tests/test_environment.py && python3 tests/test_agent_kit.py` |
+| Full | Last executable behavior phase | `python3 tests/test_environment.py && python3 tests/test_agent_kit.py` |
+| Build | Documentation or final integration | `python3 scripts/validate_framework.py && python3 tests/test_environment.py && python3 tests/test_agent_kit.py` |
 
 ## Execution Plan
 
@@ -89,6 +89,7 @@ T5 -> T6 -> T7
 **Requirement**: ENV-08, ENV-09
 **Tests**: unit
 **Gate**: quick
+**Status**: Complete
 
 ### Phase 3: Command and documentation
 

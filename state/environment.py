@@ -777,3 +777,159 @@ def extracted_ai_memory_distribution(extracted: Path) -> tuple[Path | None, Path
         if binary.is_file():
             return binary, distribution
     return None, None
+
+
+class GlobalSkillRequirement(EnvironmentRequirement):
+    """Shared read-only discovery and authorized install flow for a global skill."""
+
+    skill_name: str
+    install_command: tuple[str, ...]
+    cli_listing_command: tuple[str, ...] | None = None
+    requires_verified_origin = False
+
+    def __init__(self, harnesses: Sequence[str]) -> None:
+        self.harnesses = tuple(harnesses)
+
+    def diagnose(self, context: EnvironmentContext, platform: PlatformInfo) -> RequirementResult:
+        npx = context.executable_finder("npx")
+        checks: list[CheckResult] = [CheckResult(
+            "npx",
+            "npx",
+            RequirementStatus.OK if npx else RequirementStatus.MISSING,
+            "available" if npx else "Node.js/npm/npx required for skill installation",
+        )]
+        cli_installed = False
+        if npx and self.cli_listing_command:
+            listing = context.runner.run((npx, *self.cli_listing_command))
+            cli_installed = listing.succeeded and skill_name_in_output(listing.stdout, self.skill_name)
+            checks.append(CheckResult(
+                "official-cli",
+                "official CLI",
+                RequirementStatus.OK if cli_installed else RequirementStatus.MISSING,
+                "listed globally" if cli_installed else "not listed or CLI unavailable",
+                required=False,
+            ))
+        path, origin_verified = self._installed_path(context)
+        if cli_installed or (path is not None and (origin_verified or not self.requires_verified_origin)):
+            installed_status = RequirementStatus.OK
+            installed_detail = str(path) if path is not None else "listed by official CLI"
+        elif path is not None:
+            installed_status = RequirementStatus.PARTIAL
+            installed_detail = "skill directory found but origin is not verified"
+        else:
+            installed_status = RequirementStatus.MISSING
+            installed_detail = "not installed globally"
+        checks.append(CheckResult("global", "global skill", installed_status, installed_detail))
+        if installed_status == RequirementStatus.OK:
+            checks.extend(self._link_checks(context))
+        actions: tuple[RepairAction, ...] = ()
+        if npx and any(check.status != RequirementStatus.OK for check in checks if check.required):
+            actions = (RepairAction(
+                f"{self.id}:install",
+                self.install_description(),
+                self.id,
+            ),)
+        overall_status = installed_status if installed_status != RequirementStatus.OK else requirement_status(checks)
+        return RequirementResult(
+            id=self.id,
+            name=self.name,
+            description=self.description,
+            required=True,
+            status=overall_status,
+            checks=tuple(checks),
+            actions=actions,
+        )
+
+    def repair(
+        self,
+        context: EnvironmentContext,
+        platform: PlatformInfo,
+        action_ids: set[str],
+    ) -> tuple[OperationResult, ...]:
+        action_id = f"{self.id}:install"
+        if action_id not in action_ids:
+            return ()
+        npx = context.executable_finder("npx")
+        if not npx:
+            return (OperationResult(action_id, False, "npx unavailable"),)
+        result = context.runner.run((npx, *self.install_command), timeout=120)
+        if not result.succeeded:
+            return (OperationResult(action_id, False, command_failure(result)),)
+        verified = self.diagnose(context, platform)
+        if verified.status != RequirementStatus.OK:
+            return (OperationResult(action_id, False, "installer completed but skill verification failed"),)
+        return (OperationResult(action_id, True, "installed and verified"),)
+
+    def _installed_path(self, context: EnvironmentContext) -> tuple[Path | None, bool]:
+        for root in self._skill_roots(context):
+            directory = root / self.skill_name
+            skill = directory / "SKILL.md"
+            if safe_file_contains(skill, f"name: {self.skill_name}"):
+                return directory, self._origin_verified(directory)
+        return None, False
+
+    def _origin_verified(self, directory: Path) -> bool:
+        return True
+
+    def _skill_roots(self, context: EnvironmentContext) -> tuple[Path, ...]:
+        return (
+            context.home / ".agents" / "skills",
+            context.home / ".codex" / "skills",
+            context.home / ".config" / "opencode" / "skills",
+        )
+
+    def _link_checks(self, context: EnvironmentContext) -> tuple[CheckResult, ...]:
+        checks: list[CheckResult] = []
+        for harness in self.harnesses:
+            if harness not in {"codex", "opencode"} or not context.executable_finder(harness):
+                continue
+            linked = self._known_harness_link(context, harness)
+            checks.append(CheckResult(
+                f"{harness}-link",
+                f"{harness.title()} skill link",
+                RequirementStatus.OK if linked else RequirementStatus.MISSING,
+                "linked" if linked else "not linked",
+            ))
+        return tuple(checks)
+
+    def _known_harness_link(self, context: EnvironmentContext, harness: str) -> bool:
+        roots = {
+            "codex": (
+                context.home / ".codex" / "skills",
+                context.home / ".agents" / "skills",
+            ),
+            "opencode": (
+                context.home / ".agents" / "skills",
+                context.home / ".config" / "opencode" / "skills",
+            ),
+        }[harness]
+        return any(safe_file_contains(root / self.skill_name / "SKILL.md", f"name: {self.skill_name}") for root in roots)
+
+    def install_description(self) -> str:
+        return f"Install {self.name} globally using its official npx command"
+
+
+class CavemanRequirement(GlobalSkillRequirement):
+    id = "caveman"
+    name = "caveman"
+    description = "Compact engineering communication skill"
+    skill_name = "caveman"
+    install_command = ("skills", "add", "JuliusBrussee/caveman", "-g")
+    cli_listing_command = ("--no-install", "skills", "ls", "-g")
+
+
+class TlcSpecDrivenRequirement(GlobalSkillRequirement):
+    id = "tlc-spec-driven"
+    name = "tlc-spec-driven"
+    description = "Tech Leads Club spec-driven workflow skill"
+    skill_name = "tlc-spec-driven"
+    install_command = ("@tech-leads-club/agent-skills", "install", "-s", "tlc-spec-driven", "-g")
+    requires_verified_origin = True
+
+    def _origin_verified(self, directory: Path) -> bool:
+        return safe_file_contains(directory / ".skill-meta.json", "tech-leads-club/agent-skills")
+
+
+def skill_name_in_output(output: str, name: str) -> bool:
+    """Match the exact skill identifier, not a similarly named package."""
+    return any(line.strip().split(maxsplit=1)[0] == name for line in output.splitlines() if line.strip())

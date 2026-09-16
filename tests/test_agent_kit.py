@@ -633,8 +633,10 @@ class AgentKitTest(unittest.TestCase):
             proposal = json.loads(proposed.stdout)
             self.assertEqual("ModelProposal", proposal["kind"])
             self.assertEqual("LOW", proposal["taskClass"]["risk"])
-            self.assertEqual("opencode/nemotron-3-ultra-free", proposal["roles"][0]["recommended"]["model"])
-            self.assertEqual("opencode", proposal["roles"][0]["recommended"]["provider"])
+            # An explicit provider is strict for every role, including the
+            # orchestrator: it resolves within the requested provider scope.
+            self.assertEqual("openai/gpt-6-astra", proposal["roles"][0]["recommended"]["model"])
+            self.assertEqual("openai", proposal["roles"][0]["recommended"]["provider"])
             self.assertEqual("orchestrator", proposal["roles"][0]["recommended"]["agent"])
             developer = next(value for value in proposal["roles"] if value["role"] == "developer")
             self.assertEqual("openai/gpt-5.6-luna", developer["recommended"]["model"])

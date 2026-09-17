@@ -994,7 +994,7 @@ def ensure_model_catalog(root: Path, data: dict, args: argparse.Namespace, *, fo
     value = model_catalog.build_catalog(root, data["harnesses"], discover=discover)
     errors = model_catalog.validate_catalog(value, data["harnesses"])
     if errors:
-        fail(missing_provider_models_error(data["harnesses"], value, data.get("provider")) or "; ".join(errors))
+        fail(missing_provider_models_error(root, data["harnesses"], value, data.get("provider")) or "; ".join(errors))
     model_catalog.write_catalog(root, value)
     return "refreshed" if force or refresh else "created", value
 
@@ -1090,7 +1090,7 @@ def preflight_reinstall_catalog(
             value = model_catalog.build_catalog(staged, harnesses, discover=discover)
             errors = model_catalog.validate_catalog(value, harnesses)
             if errors:
-                hint = missing_provider_models_error(harnesses, value, provider_policy)
+                hint = missing_provider_models_error(root, harnesses, value, provider_policy)
                 fail("reinstall model preflight failed: " + (hint or "; ".join(errors)))
         selected = select_orchestrator_model(
             staged,
@@ -1553,13 +1553,14 @@ def probe_allowed_provider(root: Path, data: dict, provider: str) -> dict:
     return min(probes, key=lambda status: order[status["state"]])
 
 
-def missing_provider_models_error(harnesses: list[str], catalog_value: dict | None, policy: dict) -> str | None:
+def missing_provider_models_error(root: Path, harnesses: list[str], catalog_value: dict | None, policy: dict) -> str | None:
     """Actionable error when a strict policy's providers have no models.
 
     Replaces the cryptic catalog validation message with the missing
-    provider, what was actually found, and how to remediate (authenticate
-    in the harness, verify entitlement, or inject discovery for CI).
-    Secret-free: only provider IDs and counts, never credentials.
+    provider, what was actually found, the live probe state, and how to
+    remediate (install the harness, authenticate in it, verify entitlement,
+    or inject discovery for CI). Secret-free: only provider IDs, counts,
+    and exit-code-derived states, never credentials.
     """
     normalized = manifest_provider({"provider": policy} if policy else {})
     allowed = normalized.get("allowed") if normalized.get("strict") else None
@@ -1573,13 +1574,33 @@ def missing_provider_models_error(harnesses: list[str], catalog_value: dict | No
         if isinstance(catalog_value, dict):
             models = catalog_value.get("harnesses", {}).get(harness, {}).get("models", [])
         found = sorted({value.get("provider") for value in models if isinstance(value, dict) and value.get("provider")})
-        if not any(item in found for item in needs):
-            return (
-                f"no models for provider(s) {needs} discovered on harness {harness!r} "
-                f"(found providers: {found or ['none']}). Authenticate the provider in {harness} "
-                f"(`{harness} auth login`), verify its entitlement, then retry with --discover-models. "
-                f"For non-interactive runs without harness auth, set AGENT_KIT_{harness.upper()}_MODELS."
+        if any(item in found for item in needs):
+            continue
+        native = model_catalog.NATIVE_PROVIDER_IDS.get(needs[0], (needs[0],))[0]
+        probe = model_catalog.provider_discovery_status(root, harness, needs[0])
+        state = probe["state"]
+        if state == "harness-missing":
+            remedy = (
+                f"{harness} executable not found in PATH; install {harness.title()} "
+                f"and ensure it is on PATH, then retry."
             )
+        elif state == "provider-unavailable":
+            remedy = (
+                f"the `{harness} models {native}` probe failed. Authenticate with "
+                f"`{harness} auth login` (choose GitHub Copilot), verify the Copilot "
+                f"entitlement, then retry with --discover-models."
+            )
+        else:
+            remedy = (
+                f"the probe ran but listed no {needs} models. Verify the Copilot "
+                f"plan/entitlement and the `{harness} models {native}` output "
+                f"(try `{harness} auth login` again if needed), then retry with --discover-models."
+            )
+        return (
+            f"no models for provider(s) {needs} discovered on harness {harness!r} "
+            f"(found providers: {found or ['none']}; probe: {state}). {remedy} "
+            f"For non-interactive runs without harness auth, set AGENT_KIT_{harness.upper()}_MODELS."
+        )
     return None
 
 

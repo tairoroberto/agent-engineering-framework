@@ -363,7 +363,25 @@ class CopilotProviderTest(unittest.TestCase):
             self.assertNotEqual(0, result.returncode)
             combined = result.stdout + result.stderr
             self.assertIn("copilot", combined)
+            self.assertIn("probe: no-models", combined)
             self.assertIn("opencode auth login", combined)
+            self.assertNotIn("no configured models", combined)
+
+    def test_missing_opencode_binary_reports_install_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "consumer"
+            root.mkdir()
+            env = {**os.environ, "PATH": "/usr/bin:/bin"}
+            result = self.run_cli(
+                root, "init", "--force", "--yes", "--profile", "flutter",
+                "--harness", "opencode",
+                "--provider", "copilot",
+                "--memory-workspace", "tests", "--memory-project", root.name,
+                models=None, env=env, check=False,
+            )
+            self.assertNotEqual(0, result.returncode)
+            combined = result.stdout + result.stderr
+            self.assertIn("executable not found in PATH", combined)
             self.assertNotIn("no configured models", combined)
 
     def test_env_check_reports_copilot_routes(self) -> None:

@@ -991,10 +991,11 @@ def ensure_model_catalog(root: Path, data: dict, args: argparse.Namespace, *, fo
             if reuse:
                 fail("--reuse-model-lock requires a valid lock for every selected harness")
     discover = bool(getattr(args, "discover_models", False) or sys.stdin.isatty())
-    try:
-        value = model_catalog.refresh(root, data["harnesses"], discover=discover)
-    except ValueError as error:
-        fail(str(error))
+    value = model_catalog.build_catalog(root, data["harnesses"], discover=discover)
+    errors = model_catalog.validate_catalog(value, data["harnesses"])
+    if errors:
+        fail(missing_provider_models_error(data["harnesses"], value, data.get("provider")) or "; ".join(errors))
+    model_catalog.write_catalog(root, value)
     return "refreshed" if force or refresh else "created", value
 
 
@@ -1089,7 +1090,8 @@ def preflight_reinstall_catalog(
             value = model_catalog.build_catalog(staged, harnesses, discover=discover)
             errors = model_catalog.validate_catalog(value, harnesses)
             if errors:
-                fail("reinstall model preflight failed: " + "; ".join(errors))
+                hint = missing_provider_models_error(harnesses, value, provider_policy)
+                fail("reinstall model preflight failed: " + (hint or "; ".join(errors)))
         selected = select_orchestrator_model(
             staged,
             {"harnesses": harnesses, **({"provider": provider_policy} if provider_policy else {})},
@@ -1533,6 +1535,54 @@ def provider_needs_discovery(harness: str, provider: str | None) -> bool:
     return bool(provider) and provider not in static_providers_for(harness)
 
 
+def probe_allowed_provider(root: Path, data: dict, provider: str) -> dict:
+    """Best availability probe for a provider across harnesses that serve it.
+
+    A provider static for every selected harness needs no live probe; when
+    several harnesses can serve it (e.g. copilot via the copilot harness or
+    via opencode), the best state wins. Secret-free: IDs and counts only.
+    """
+    candidates = [
+        harness for harness in data["harnesses"]
+        if provider not in static_providers_for(harness)
+    ]
+    if not candidates:
+        return {"harness": data["harnesses"][0], "provider": provider, "state": "configured", "models": []}
+    order = {"available": 0, "no-models": 1, "provider-unavailable": 2, "harness-missing": 3}
+    probes = [model_catalog.provider_discovery_status(root, harness, provider) for harness in candidates]
+    return min(probes, key=lambda status: order[status["state"]])
+
+
+def missing_provider_models_error(harnesses: list[str], catalog_value: dict | None, policy: dict) -> str | None:
+    """Actionable error when a strict policy's providers have no models.
+
+    Replaces the cryptic catalog validation message with the missing
+    provider, what was actually found, and how to remediate (authenticate
+    in the harness, verify entitlement, or inject discovery for CI).
+    Secret-free: only provider IDs and counts, never credentials.
+    """
+    normalized = manifest_provider({"provider": policy} if policy else {})
+    allowed = normalized.get("allowed") if normalized.get("strict") else None
+    if not allowed:
+        return None
+    for harness in harnesses:
+        needs = [item for item in allowed if item not in static_providers_for(harness)]
+        if not needs:
+            continue
+        models = []
+        if isinstance(catalog_value, dict):
+            models = catalog_value.get("harnesses", {}).get(harness, {}).get("models", [])
+        found = sorted({value.get("provider") for value in models if isinstance(value, dict) and value.get("provider")})
+        if not any(item in found for item in needs):
+            return (
+                f"no models for provider(s) {needs} discovered on harness {harness!r} "
+                f"(found providers: {found or ['none']}). Authenticate the provider in {harness} "
+                f"(`{harness} auth login`), verify its entitlement, then retry with --discover-models. "
+                f"For non-interactive runs without harness auth, set AGENT_KIT_{harness.upper()}_MODELS."
+            )
+    return None
+
+
 def command_init(args: argparse.Namespace) -> None:
     root = Path(args.root).resolve()
     if not root.is_dir():
@@ -1570,7 +1620,7 @@ def command_init(args: argparse.Namespace) -> None:
         provider_default = provider_allowed = None
         provider_strict = None
     effective_provider = provider_default or (existing_policy.get("default") if args.force else None)
-    if provider_needs_discovery(harnesses[0], effective_provider):
+    if effective_provider and any(provider_needs_discovery(harness, effective_provider) for harness in harnesses):
         args.discover_models = True
     staged_catalog: dict | None = None
     staged_catalog_status = "refreshed"
@@ -1848,12 +1898,12 @@ def command_doctor(args: argparse.Namespace) -> None:
             for detail in executable:
                 errors.append(detail)
         for provider in sorted(set(policy.get("allowed") or []) - OPENCODE_STATIC_PROVIDERS):
-            status = model_catalog.provider_discovery_status(root, data["harnesses"][0], provider)
+            status = probe_allowed_provider(root, data, provider)
             state = status["state"]
             print(f"PROVIDER_STATUS {provider}: {state} ({len(status['models'])} models)")
             if state == "harness-missing":
                 warnings.append(f"{provider} probe skipped: control harness executable not found")
-            elif state != "available":
+            elif state not in ("available", "configured"):
                 errors.append(f"{provider.upper()}_PROVIDER_UNAVAILABLE: {state}")
     for harness in data["harnesses"]:
         adapter = managed / "harness" / f"{harness}.md"
@@ -2039,14 +2089,16 @@ def project_provider_report(root: Path) -> dict | None:
     for provider in interest:
         if not harness_installed:
             state, count = "harness-missing", 0
+        elif provider in static_providers_for(primary):
+            state, count = "configured", 0
         else:
-            status = model_catalog.provider_discovery_status(root, primary, provider)
+            status = probe_allowed_provider(root, data, provider)
             state, count = status["state"], len(status["models"])
         providers.append({"provider": provider, "state": state, "models": count})
     routes = project_route_readiness(root, data, catalog, policy.get("allowed"))
     healthy = (
         harness_installed
-        and all(item["state"] == "available" for item in providers)
+        and all(item["state"] in ("available", "configured") for item in providers)
         and all(routes.values())
     )
     return {

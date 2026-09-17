@@ -335,6 +335,37 @@ class CopilotProviderTest(unittest.TestCase):
                 for alternative in contract["alternatives"]:
                     self.assertNotIn(alternative["provider"], forbidden)
 
+    def test_multi_harness_copilot_primary_init_force_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "consumer"
+            root.mkdir()
+            result = self.run_cli(
+                root, "init", "--force", "--yes", "--profile", "flutter",
+                "--harness", "copilot", "--harness", "opencode",
+                "--provider", "copilot",
+                "--memory-workspace", "tests", "--memory-project", root.name,
+            )
+            self.assertIn("PROVIDER: default=copilot", result.stdout)
+            self.assertIn("DOCTOR: PASS", result.stdout)
+            self.run_cli(root, "doctor")
+
+    def test_missing_copilot_models_reports_actionable_error(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "consumer"
+            root.mkdir()
+            result = self.run_cli(
+                root, "init", "--force", "--yes", "--profile", "flutter",
+                "--harness", "copilot", "--harness", "opencode",
+                "--provider", "copilot",
+                "--memory-workspace", "tests", "--memory-project", root.name,
+                models="", check=False,
+            )
+            self.assertNotEqual(0, result.returncode)
+            combined = result.stdout + result.stderr
+            self.assertIn("copilot", combined)
+            self.assertIn("opencode auth login", combined)
+            self.assertNotIn("no configured models", combined)
+
     def test_env_check_reports_copilot_routes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "consumer"

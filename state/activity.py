@@ -253,13 +253,44 @@ def proposal_role(
     floor: str,
     orchestrator_model: str | None,
 ) -> dict[str, Any]:
-    floor_rank = class_rank(floor) if family == "modelClasses" else {
+    # The orchestrator contract prefers strongest-appropriate but accepts the
+    # strongest suitable control-plane model (strong-coding floor, consistent
+    # with init-time selection): best-available within the provider scope,
+    # never a cross-provider downgrade.
+    floors = [floor]
+    if role == "orchestrator" and family == "modelClasses" and floor == "strongest-appropriate":
+        floors.append("strong-coding")
+    last_error: ValueError | None = None
+    for effective_floor in floors:
+        try:
+            return build_role_contract(
+                root, lock, mapping, harness, provider,
+                role, family, floor, effective_floor, orchestrator_model,
+            )
+        except ValueError as error:
+            last_error = error
+    raise last_error if last_error is not None else ValueError(f"no eligible model for {role}")
+
+
+def build_role_contract(
+    root: Path,
+    lock: dict[str, Any],
+    mapping: dict[str, Any],
+    harness: str,
+    provider: str | set[str],
+    role: str,
+    family: str,
+    floor: str,
+    effective_floor: str,
+    orchestrator_model: str | None,
+) -> dict[str, Any]:
+    floor_rank = class_rank(effective_floor) if family == "modelClasses" else {
         "independent-reviewer": 1,
         "specialist-review": 2,
         "qa-basic": 0,
         "qa-targeted": 1,
         "qa-adversarial": 2,
-    }.get(floor, 1)
+    }.get(effective_floor, 1)
     mapped = mapping_options(mapping, family, floor, provider)
     mapped_by_model = family_model_routes(mapping, family, provider)
     preferred_models = {str(item["model"]) for item in mapped}
@@ -276,12 +307,12 @@ def proposal_role(
         eligible = meets_floor and dispatchable
         reason = None
         if not meets_floor:
-            reason = f"below {floor} floor"
+            reason = f"below {effective_floor} floor"
         elif not dispatchable:
             reason = "no generated adapter or per-invocation route"
         estimate = estimate_for(
             root, harness, identifier,
-            floor if family == "modelClasses" else candidate_class,
+            effective_floor if family == "modelClasses" else candidate_class,
             role,
         )
         route_entry = mapped_by_model.get(identifier, {})
@@ -292,7 +323,7 @@ def proposal_role(
             "eligible": eligible,
             "disabledReason": reason,
             "agent": "orchestrator" if role == "orchestrator" else route_entry.get("agent", role),
-            "reasoningEffort": route_entry.get("reasoningEffort") or routing.default_reasoning_effort(family, floor),
+            "reasoningEffort": route_entry.get("reasoningEffort") or routing.default_reasoning_effort(family, effective_floor),
             "estimate": estimate,
             "_index": index,
         })
@@ -307,7 +338,7 @@ def proposal_role(
         if not pool:
             prefix = "ORCHESTRATOR_UNAVAILABLE: " if role == "orchestrator" else ""
             scope_label = provider if isinstance(provider, str) else f"one of {sorted(provider)}"
-            raise ValueError(f"{prefix}no eligible {scope_label} model for {role} at {floor}")
+            raise ValueError(f"{prefix}no eligible {scope_label} model for {role} at {effective_floor}")
         if role == "orchestrator":
             ordered = [str(value["model"]) for value in mapped]
             chosen = min(pool, key=lambda value: ordered.index(value["model"]) if value["model"] in ordered else len(ordered))
@@ -320,11 +351,11 @@ def proposal_role(
     return {
         "role": role,
         "family": family,
-        "floor": floor,
+        "floor": effective_floor,
         "locked": role == "orchestrator",
         "recommended": chosen,
         "alternatives": alternatives,
-        "justification": f"{role} requires {floor}; cheapest eligible candidate uses verified cost/tokens when available",
+        "justification": f"{role} requires {effective_floor}; cheapest eligible candidate uses verified cost/tokens when available",
     }
 
 

@@ -991,7 +991,10 @@ def ensure_model_catalog(root: Path, data: dict, args: argparse.Namespace, *, fo
             if reuse:
                 fail("--reuse-model-lock requires a valid lock for every selected harness")
     discover = bool(getattr(args, "discover_models", False) or sys.stdin.isatty())
-    value = model_catalog.build_catalog(root, data["harnesses"], discover=discover)
+    value = model_catalog.build_catalog(
+        root, data["harnesses"], discover=discover,
+        providers_hint=catalog_providers_hint(data.get("provider")),
+    )
     errors = model_catalog.validate_catalog(value, data["harnesses"])
     if errors:
         fail(missing_provider_models_error(root, data["harnesses"], value, data.get("provider")) or "; ".join(errors))
@@ -1087,7 +1090,10 @@ def preflight_reinstall_catalog(
                 target.write_text(content, encoding="utf-8")
         if value is None:
             discover = bool(args.discover_models or sys.stdin.isatty())
-            value = model_catalog.build_catalog(staged, harnesses, discover=discover)
+            value = model_catalog.build_catalog(
+                staged, harnesses, discover=discover,
+                providers_hint=catalog_providers_hint(provider_policy),
+            )
             errors = model_catalog.validate_catalog(value, harnesses)
             if errors:
                 hint = missing_provider_models_error(root, harnesses, value, provider_policy)
@@ -1530,6 +1536,11 @@ def static_providers_for(harness: str) -> set[str]:
     }.get(harness, {harness})
 
 
+def catalog_providers_hint(policy: dict | None) -> list[str] | None:
+    """Allowed providers the catalog discovery should cover when present."""
+    return manifest_provider({"provider": policy} if policy else {}).get("allowed")
+
+
 def provider_needs_discovery(harness: str, provider: str | None) -> bool:
     """A non-statically-covered provider requires live model discovery."""
     return bool(provider) and provider not in static_providers_for(harness)
@@ -1794,6 +1805,28 @@ def iter_route_candidates(mapping: dict) -> list[tuple[str, str, dict]]:
     return rows
 
 
+PORTABLE_CLASS_RANK = {
+    "cost-efficient-coding": 0,
+    "balanced-coding": 1,
+    "strong-coding": 2,
+    "strongest-appropriate": 3,
+}
+
+
+def catalog_class_rank(catalog: dict | None, harness: str, model: str) -> int:
+    """Highest portable class rank of a catalog model; -1 when unknown."""
+    if not isinstance(catalog, dict):
+        return -1
+    models = catalog.get("harnesses", {}).get(harness, {}).get("models", [])
+    for value in models:
+        if isinstance(value, dict) and value.get("id") == model:
+            return max(
+                [PORTABLE_CLASS_RANK.get(cls, -1) for cls in (value.get("classes") or [])],
+                default=-1,
+            )
+    return -1
+
+
 def check_forbidden_routes(root: Path, data: dict, allowed: list[str]) -> list[str]:
     """A strict project must have no executable route outside allowed providers."""
     problems: list[str] = []
@@ -1826,15 +1859,19 @@ def check_executable_routes(root: Path, data: dict, catalog: dict, allowed: list
         for value in catalog.get("harnesses", {}).get(primary, {}).get("models", [])
         if isinstance(value, dict) and value.get("available", True) and value.get("provider") in allowed
     }
-    for family, class_name in (("modelClasses", "strongest-appropriate"), ("modelClasses", "balanced-coding")):
-        entry = mapping.get(family, {}).get(class_name, {}) if isinstance(mapping, dict) else {}
-        candidates = entry.get("candidates") if isinstance(entry, dict) else None
-        options = candidates if isinstance(candidates, list) else [entry]
-        runnable = [
-            option for option in options
-            if isinstance(option, dict) and option.get("provider") in allowed and option.get("model") in available
-        ]
-        plane = "orchestrator" if class_name == "strongest-appropriate" else "developer"
+    for plane, min_rank in (("orchestrator", 2), ("developer", 1)):
+        runnable = []
+        entries = mapping.get("modelClasses", {}) if isinstance(mapping, dict) else {}
+        for entry in entries.values():
+            if not isinstance(entry, dict):
+                continue
+            candidates = entry.get("candidates") if isinstance(entry, dict) else None
+            options = candidates if isinstance(candidates, list) else [entry]
+            runnable.extend(
+                option for option in options
+                if isinstance(option, dict) and option.get("provider") in allowed and option.get("model") in available
+                and catalog_class_rank(catalog, primary, str(option.get("model"))) >= min_rank
+            )
         print(f"EXECUTION_ROUTE {plane}: {'ready' if runnable else 'missing'}")
         if not runnable:
             problems.append(f"UNROUTABLE: no allowed {allowed} route for {plane} on {primary}")
@@ -2046,10 +2083,10 @@ def render_environment_actions(actions: tuple[environment_runtime.RepairAction, 
 def project_route_readiness(root: Path, data: dict, catalog: dict | None, allowed: list[str] | None) -> dict[str, bool]:
     """Per-plane executability within the allowed providers, secret-free."""
     planes = {
-        "orchestrator": ("modelClasses", "strongest-appropriate"),
-        "developer": ("modelClasses", "balanced-coding"),
-        "reviewer": ("reviewClasses", "independent-reviewer"),
-        "qa": ("qaClasses", "qa-targeted"),
+        "orchestrator": ("modelClasses", ("strongest-appropriate", "strong-coding"), 2),
+        "developer": ("modelClasses", ("balanced-coding", "strong-coding", "strongest-appropriate", "cost-efficient-coding"), 1),
+        "reviewer": ("reviewClasses", ("independent-reviewer",), 0),
+        "qa": ("qaClasses", ("qa-targeted",), 0),
     }
     primary = data["harnesses"][0]
     try:
@@ -2065,16 +2102,25 @@ def project_route_readiness(root: Path, data: dict, catalog: dict | None, allowe
             and (allowed is None or value.get("provider") in allowed)
         }
     readiness: dict[str, bool] = {}
-    for plane, (family, class_name) in planes.items():
-        entry = mapping.get(family, {}).get(class_name, {}) if isinstance(mapping, dict) else {}
-        candidates = entry.get("candidates") if isinstance(entry, dict) else None
-        options = candidates if isinstance(candidates, list) else [entry]
-        readiness[plane] = any(
-            isinstance(option, dict)
-            and (allowed is None or option.get("provider", primary) in allowed)
-            and option.get("model") in available
-            for option in options
-        )
+    for plane, (family, class_names, min_rank) in planes.items():
+        if isinstance(class_names, str):
+            class_names = (class_names,)
+        ready = False
+        for class_name in class_names:
+            entry = mapping.get(family, {}).get(class_name, {}) if isinstance(mapping, dict) else {}
+            candidates = entry.get("candidates") if isinstance(entry, dict) else None
+            options = candidates if isinstance(candidates, list) else [entry]
+            ready = ready or any(
+                isinstance(option, dict)
+                and (allowed is None or option.get("provider", primary) in allowed)
+                and option.get("model") in available
+                and (
+                    family != "modelClasses" or allowed is None
+                    or catalog_class_rank(catalog, primary, str(option.get("model"))) >= min_rank
+                )
+                for option in options
+            )
+        readiness[plane] = ready
     return readiness
 
 
@@ -2209,6 +2255,7 @@ def command_catalog(args: argparse.Namespace) -> None:
             value = model_catalog.refresh(
                 root, args.harness or data["harnesses"],
                 discover=not args.configured_only, merge=bool(args.harness),
+                providers_hint=catalog_providers_hint(data.get("provider")),
             )
         except ValueError as error:
             fail(str(error))

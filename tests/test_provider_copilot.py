@@ -28,6 +28,14 @@ COPILOT_FIXTURE_MODELS = ",".join((
 ))
 
 
+USER_FIXTURE_MODELS = ",".join((
+    "github-copilot/gemini-3.7-flash",
+    "github-copilot/gpt-5.3-codex",
+    "github-copilot/gpt-5.6-luna",
+    "github-copilot/mai-code-1.1-flash",
+))
+
+
 class CopilotProviderTest(unittest.TestCase):
     def run_cli(
         self, root: Path, *args: str, check: bool = True,
@@ -383,6 +391,58 @@ class CopilotProviderTest(unittest.TestCase):
             combined = result.stdout + result.stderr
             self.assertIn("executable not found in PATH", combined)
             self.assertNotIn("no configured models", combined)
+
+    def test_real_world_entitlement_without_strongest_model(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "consumer"
+            root.mkdir()
+            result = self.run_cli(
+                root, "init", "--force", "--yes", "--profile", "flutter",
+                "--harness", "copilot", "--harness", "opencode",
+                "--provider", "copilot",
+                "--memory-workspace", "tests", "--memory-project", root.name,
+                models=USER_FIXTURE_MODELS,
+            )
+            self.assertIn("DOCTOR: PASS", result.stdout)
+            self.write_task(root)
+            proposal = json.loads(self.run_cli(
+                root, "route", "simulate", "T33", "--workflow", "continue",
+                "--harness", "opencode", "--provider", "copilot", "--json",
+                models=USER_FIXTURE_MODELS,
+            ).stdout)
+            orchestrator = next(value for value in proposal["roles"] if value["role"] == "orchestrator")
+            self.assertEqual("github-copilot/gpt-5.3-codex", orchestrator["recommended"]["model"])
+            self.assertEqual("copilot", orchestrator["recommended"]["provider"])
+            for contract in proposal["roles"]:
+                self.assertEqual("copilot", contract["recommended"]["provider"])
+
+    def test_filtered_probe_fallback_when_full_list_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            root = base / "consumer"
+            root.mkdir()
+            fake_bin = base / "fakebin"
+            fake_bin.mkdir()
+            (fake_bin / "opencode").write_text(
+                "#!/bin/sh\n"
+                'if [ "$1" = "models" ] && [ "$2" = "github-copilot" ]; then\n'
+                '  echo "github-copilot/gpt-5.3-codex"\n'
+                "  exit 0\n"
+                "fi\n"
+                "exit 1\n",
+                encoding="utf-8",
+            )
+            (fake_bin / "opencode").chmod(0o755)
+            env = {**os.environ, "PATH": f"{fake_bin}:/usr/bin:/bin"}
+            result = self.run_cli(
+                root, "init", "--force", "--yes", "--profile", "flutter",
+                "--harness", "opencode",
+                "--provider", "copilot",
+                "--memory-workspace", "tests", "--memory-project", root.name,
+                models=None, env=env,
+            )
+            self.assertIn("ORCHESTRATOR_MODEL: github-copilot/gpt-5.3-codex", result.stdout)
+            self.assertIn("DOCTOR: PASS", result.stdout)
 
     def test_env_check_reports_copilot_routes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

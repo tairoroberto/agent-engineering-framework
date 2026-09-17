@@ -222,18 +222,56 @@ def parse_verbose_models(output: str, harness: str) -> list[dict[str, Any]]:
     return entries
 
 
-def run_discovery(command: list[str] | None, executable: str, root: Path) -> tuple[int | None, str]:
+def run_discovery(command: list[str] | None, executable: str, root: Path, *, timeout: float = 10) -> tuple[int | None, str]:
     """Run one discovery probe. Returns (returncode, stdout); None when skipped."""
     if command is None or shutil.which(executable) is None:
         return None, ""
     try:
-        result = subprocess.run(command, cwd=root, text=True, capture_output=True, timeout=10, check=False)
+        result = subprocess.run(command, cwd=root, text=True, capture_output=True, timeout=timeout, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return None, ""
     return result.returncode, result.stdout
 
 
-def discover_models(root: Path, harness: str) -> tuple[list[dict[str, Any]], str | None]:
+def probe_native_providers(root: Path, harness: str, providers: list[str]) -> list[dict[str, Any]]:
+    """Filtered per-provider discovery (`opencode models <provider>`).
+
+    Fallback for environments where the full model list comes back empty or
+    fails but a provider-filtered probe works. Only IDs are probed — models
+    are still discovered dynamically, never hardcoded. Prefers the rich
+    verbose document per provider, falling back to the plain filtered list.
+    """
+    if harness != "opencode":
+        return []
+    executable = EXECUTABLES[harness]
+    merged: list[dict[str, Any]] = []
+    for provider in providers:
+        for native in NATIVE_PROVIDER_IDS.get(provider, (provider,)):
+            items: list[dict[str, Any]] = []
+            returncode, stdout = run_discovery([executable, "models", native, "--verbose"], executable, root)
+            if returncode == 0 and stdout.strip():
+                items = [
+                    entry for entry in parse_verbose_models(stdout, harness)
+                    if entry.get("provider") == provider
+                ]
+            if not items:
+                returncode, stdout = run_discovery([executable, "models", native], executable, root)
+                if returncode == 0:
+                    items = [
+                        {
+                            "id": model if "/" in model else f"{native}/{model}",
+                            "provider": normalize_provider(model.split("/", 1)[0] if "/" in model else native, harness),
+                        }
+                        for model in dict.fromkeys(MODEL_LINE.findall(stdout))
+                    ]
+                    items = [entry for entry in items if entry.get("provider") == provider]
+            if items:
+                merged.extend(items)
+                break
+    return merged
+
+
+def discover_models(root: Path, harness: str, *, providers_hint: list[str] | None = None) -> tuple[list[dict[str, Any]], str | None]:
     injected = os.environ.get(f"AGENT_KIT_{harness.upper()}_MODELS")
     if injected is not None:
         entries: list[dict[str, Any]] = []
@@ -242,22 +280,26 @@ def discover_models(root: Path, harness: str) -> tuple[list[dict[str, Any]], str
             entries.append({"id": value, "provider": normalize_provider(native, harness)})
         return entries, "environment"
     executable = EXECUTABLES[harness]
+    found: list[dict[str, Any]] = []
     verbose = discovery_verbose_command(harness)
     if verbose is not None:
-        returncode, stdout = run_discovery(verbose, executable, root)
+        returncode, stdout = run_discovery(verbose, executable, root, timeout=30)
         if returncode == 0 and stdout.strip():
-            parsed = parse_verbose_models(stdout, harness)
-            if parsed:
-                return parsed, "harness"
-    command = discovery_command(harness)
-    returncode, stdout = run_discovery(command, executable, root)
-    if returncode is None or returncode != 0:
+            found = parse_verbose_models(stdout, harness)
+    if not found:
+        command = discovery_command(harness)
+        returncode, stdout = run_discovery(command, executable, root, timeout=30)
+        if returncode is not None and returncode == 0:
+            models = list(dict.fromkeys(MODEL_LINE.findall(stdout)))
+            found = [
+                {"id": model, "provider": normalize_provider(model.split("/", 1)[0] if "/" in model else harness, harness)}
+                for model in models
+            ]
+    if not found and providers_hint:
+        found = probe_native_providers(root, harness, providers_hint)
+    if not found:
         return [], None
-    models = list(dict.fromkeys(MODEL_LINE.findall(stdout)))
-    return [
-        {"id": model, "provider": normalize_provider(model.split("/", 1)[0] if "/" in model else harness, harness)}
-        for model in models
-    ], "harness"
+    return found, "harness"
 
 
 def provider_discovery_status(root: Path, harness: str, provider: str) -> dict[str, Any]:
@@ -303,12 +345,12 @@ def provider_discovery_status(root: Path, harness: str, provider: str) -> dict[s
     return {"harness": harness, "provider": provider, "state": "no-models" if source else "provider-unavailable", "models": []}
 
 
-def build_catalog(root: Path, harnesses: list[str], *, discover: bool = True) -> dict[str, Any]:
+def build_catalog(root: Path, harnesses: list[str], *, discover: bool = True, providers_hint: list[str] | None = None) -> dict[str, Any]:
     catalog_harnesses: dict[str, Any] = {}
     for harness in harnesses:
         configured = configured_models(root, harness)
         by_key = {(entry["provider"], entry["id"]): entry for entry in configured}
-        discovered, discovery_source = discover_models(root, harness) if discover else ([], None)
+        discovered, discovery_source = discover_models(root, harness, providers_hint=providers_hint) if discover else ([], None)
         for item in discovered:
             model = item["id"] if isinstance(item, dict) else str(item)
             provider = item.get("provider", harness) if isinstance(item, dict) else harness
@@ -395,8 +437,8 @@ def load_catalog(root: Path) -> dict[str, Any]:
     return value
 
 
-def refresh(root: Path, harnesses: list[str], *, discover: bool = True, merge: bool = False) -> dict[str, Any]:
-    value = build_catalog(root, harnesses, discover=discover)
+def refresh(root: Path, harnesses: list[str], *, discover: bool = True, merge: bool = False, providers_hint: list[str] | None = None) -> dict[str, Any]:
+    value = build_catalog(root, harnesses, discover=discover, providers_hint=providers_hint)
     if merge and (root / LOCK_PATH).is_file():
         try:
             current = load_catalog(root)

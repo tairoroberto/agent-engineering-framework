@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from model_router import ModelDescriptor
+
 
 LOCK_PATH = Path(".agent-managed/model-catalog.lock.json")
 HARNESS_ROOTS = {
@@ -40,12 +42,7 @@ HARNESS_CAPABILITIES = {
     "copilot": {"modelDiscovery": False, "perInvocationModel": True, "reasoningEffort": False, "effectiveModelReceipt": True},
     "claude": {"modelDiscovery": False, "perInvocationModel": True, "reasoningEffort": True, "effectiveModelReceipt": True},
 }
-CLASS_ORDER = (
-    "cost-efficient-coding",
-    "balanced-coding",
-    "strong-coding",
-    "strongest-appropriate",
-)
+CLASS_ORDER = ("cost-efficient-coding", "balanced-coding", "strong-coding", "strongest-appropriate")
 MODEL_LINE = re.compile(r"(?<![A-Za-z0-9._/-])([A-Za-z0-9._-]+/[A-Za-z0-9._:@+-]+)(?![A-Za-z0-9._/-])")
 
 
@@ -72,14 +69,86 @@ def normalize_provider(provider: str, harness: str) -> str:
 
 
 def classify_model(model: str) -> str:
-    lowered = model.lower()
-    if any(token in lowered for token in ("nano", "mini", "haiku", "flash", "mimo", "luna")):
-        return CLASS_ORDER[0]
-    if any(token in lowered for token in ("opus", "astra", "ultra", "max")):
-        return CLASS_ORDER[3]
-    if any(token in lowered for token in ("sol", "pro", "sonnet", "codex", "reason")):
-        return CLASS_ORDER[2]
+    """Legacy compatibility class, never a model-name quality heuristic.
+
+    Unknown discovered models remain balanced until provider metadata or a
+    project override classifies them. Routing itself uses descriptors.
+    """
     return CLASS_ORDER[1]
+
+
+def descriptor_fields(*, classes: list[str], capabilities: list[str], source: str) -> dict[str, Any]:
+    """Normalize legacy class data into provider-neutral descriptor metadata."""
+    rank = max((CLASS_ORDER.index(value) for value in classes if value in CLASS_ORDER), default=1)
+    tier = ("ECONOMY", "STANDARD", "PREMIUM", "PREMIUM")[rank]
+    level = ("low", "medium", "high", "high")[rank]
+    return {
+        "displayName": None,
+        "inputCostPer1MTokens": None,
+        "outputCostPer1MTokens": None,
+        "reasoningCostPer1MTokens": None,
+        "costTier": tier,
+        "reasoningCapability": level if "reasoning" in capabilities or rank >= 2 else "unknown",
+        "codingCapability": level,
+        "reviewCapability": level,
+        "toolCapability": level if "toolcall" in capabilities else "medium",
+        "maxOutputTokens": None,
+        "supportsTools": True,
+        "supportsReasoning": "reasoning" in capabilities or (True if rank >= 2 else None),
+        "supportsStructuredOutput": None,
+        "speedTier": None,
+        "metadataSource": source,
+    }
+
+
+def descriptor_from_entry(entry: dict[str, Any]) -> ModelDescriptor:
+    """Read v1 catalog entries and v2 descriptor fields without name inference."""
+    return ModelDescriptor(
+        provider=str(entry.get("provider", "unknown")), model_id=str(entry.get("id", "unknown")),
+        display_name=entry.get("displayName"),
+        input_cost_per_1m_tokens=entry.get("inputCostPer1MTokens"),
+        output_cost_per_1m_tokens=entry.get("outputCostPer1MTokens"),
+        reasoning_cost_per_1m_tokens=entry.get("reasoningCostPer1MTokens"),
+        cost_tier=str(entry.get("costTier", "STANDARD")),
+        reasoning_capability=str(entry.get("reasoningCapability", "unknown")),
+        coding_capability=str(entry.get("codingCapability", "medium")),
+        review_capability=str(entry.get("reviewCapability", "medium")),
+        tool_capability=str(entry.get("toolCapability", "medium")),
+        context_window=entry.get("contextWindow"), max_output_tokens=entry.get("maxOutputTokens"),
+        supports_tools=entry.get("supportsTools", True), supports_reasoning=entry.get("supportsReasoning"),
+        supports_structured_output=entry.get("supportsStructuredOutput"), speed_tier=entry.get("speedTier"),
+        availability=bool(entry.get("available", True)), metadata_source=str(entry.get("metadataSource", entry.get("source", "harness"))),
+    )
+
+
+def apply_metadata_overrides(entries: list[dict[str, Any]], overrides: Any) -> list[dict[str, Any]]:
+    """Apply project-owned catalog metadata in one place.
+
+    Keys are ``provider/model`` and values use descriptor camelCase fields.
+    Unknown keys are retained only when they are recognized descriptor fields.
+    """
+    if not isinstance(overrides, dict):
+        return entries
+    allowed = {
+        "displayName", "inputCostPer1MTokens", "outputCostPer1MTokens", "reasoningCostPer1MTokens",
+        "costTier", "reasoningCapability", "codingCapability", "reviewCapability", "toolCapability",
+        "contextWindow", "maxOutputTokens", "supportsTools", "supportsReasoning", "supportsStructuredOutput",
+        "speedTier", "availability",
+    }
+    result: list[dict[str, Any]] = []
+    for entry in entries:
+        updated = dict(entry)
+        key = f"{entry.get('provider')}/{entry.get('id')}"
+        override = overrides.get(key)
+        if isinstance(override, dict):
+            updated.update({name: value for name, value in override.items() if name in allowed})
+            updated["metadataSource"] = "project-override"
+            updated["costUnknown"] = not (
+                isinstance(updated.get("inputCostPer1MTokens"), (int, float))
+                and isinstance(updated.get("outputCostPer1MTokens"), (int, float))
+            )
+        result.append(updated)
+    return result
 
 
 def configured_models(root: Path, harness: str) -> list[dict[str, Any]]:
@@ -122,6 +191,9 @@ def configured_models(root: Path, harness: str) -> list[dict[str, Any]]:
                 effort = option.get("reasoningEffort")
                 if isinstance(effort, str) and effort not in entry["reasoningEfforts"]:
                     entry["reasoningEfforts"].append(effort)
+                entry.update(descriptor_fields(
+                    classes=entry["classes"], capabilities=entry["capabilities"], source="configured",
+                ))
     return list(found.values())
 
 
@@ -217,6 +289,7 @@ def parse_verbose_models(output: str, harness: str) -> list[dict[str, Any]]:
             "available": document.get("status", "active") == "active",
             "price": None,
             "costUnknown": True,
+            **descriptor_fields(classes=[classify_model(full_id)], capabilities=capabilities, source="harness"),
         })
         index = end + 1
     return entries
@@ -368,6 +441,11 @@ def build_catalog(root: Path, harnesses: list[str], *, discover: bool = True, pr
                     "available": item.get("available", True) if isinstance(item, dict) else True,
                     "price": None,
                     "costUnknown": True,
+                    **descriptor_fields(
+                        classes=item.get("classes", [classify_model(model)]) if isinstance(item, dict) else [classify_model(model)],
+                        capabilities=item.get("capabilities", ["coding"]) if isinstance(item, dict) else ["coding"],
+                        source=discovery_source or "harness",
+                    ),
                 }
         models = sorted(by_key.values(), key=lambda item: (item["provider"], item["id"]))
         catalog_harnesses[harness] = {

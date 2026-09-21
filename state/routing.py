@@ -251,14 +251,10 @@ def max_model_class(*classes: str) -> str:
 def route_task(task: TaskDefinition, execution: dict[str, Any], policy: dict[str, Any], *, complexity: str | None = None, risk: str | None = None) -> dict[str, Any]:
     complexity = complexity or task.complexity
     risk = risk or task.risk
-    model_class = max_model_class(
-        policy["complexityModelClass"][complexity],
-        policy["riskMinimumModelClass"][risk],
-        *(policy["capabilityMinimumModelClass"].get(cap, MODEL_CLASS_ORDER[0]) for cap in task.capabilities),
-    )
-    budget = policy["budgetModes"][execution["mode"]]
-    if budget["qualityUpgrade"] and model_class != MODEL_CLASS_ORDER[-1]:
-        model_class = MODEL_CLASS_ORDER[MODEL_CLASS_ORDER.index(model_class) + budget["qualityUpgrade"]]
+    # Complexity and risk choose gates/review depth. They never raise a worker
+    # to a premium model by default; ModelRouter treats capabilities as a
+    # constraint and cost as the optimization target.
+    model_class = MODEL_CLASS_ORDER[0]
     verification = list(policy["riskVerification"][risk])
     if risk in {"HIGH", "CRITICAL"}:
         for capability in (*task.capabilities, *task.domains):

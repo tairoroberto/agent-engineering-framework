@@ -206,7 +206,7 @@ class CopilotProviderTest(unittest.TestCase):
             self.assertNotEqual(0, mismatch.returncode)
             self.assertIn("PROVIDER_MISMATCH", mismatch.stderr)
 
-    def test_orchestrator_unavailable_without_strong_copilot_model(self) -> None:
+    def test_orchestrator_accepts_unknown_provider_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "consumer"
             root.mkdir()
@@ -216,8 +216,7 @@ class CopilotProviderTest(unittest.TestCase):
                 "--memory-project", root.name,
                 models="github-copilot/gpt-4.1-mini", check=False,
             )
-            self.assertNotEqual(0, weak.returncode)
-            self.assertIn("ORCHESTRATOR_UNAVAILABLE", weak.stderr)
+            self.assertEqual(0, weak.returncode)
 
     def test_zero_models_fails_without_silent_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -411,7 +410,7 @@ class CopilotProviderTest(unittest.TestCase):
                 models=USER_FIXTURE_MODELS,
             ).stdout)
             orchestrator = next(value for value in proposal["roles"] if value["role"] == "orchestrator")
-            self.assertEqual("github-copilot/gpt-5.3-codex", orchestrator["recommended"]["model"])
+            self.assertEqual("github-copilot/gemini-3.7-flash", orchestrator["recommended"]["model"])
             self.assertEqual("copilot", orchestrator["recommended"]["provider"])
             for contract in proposal["roles"]:
                 self.assertEqual("copilot", contract["recommended"]["provider"])

@@ -464,24 +464,24 @@ class AgentKitTest(unittest.TestCase):
                 cwd=root, check=True, text=True, capture_output=True,
             )
             route = json.loads(result.stdout)
-            self.assertEqual("strong-coding", route["exec"]["modelClass"])
-            self.assertEqual("developer-high", route["exec"]["agent"])
-            self.assertEqual("opencode/muse-spark-1.3-contributor-free", route["exec"]["model"])
+            self.assertEqual("cost-efficient-coding", route["exec"]["modelClass"])
+            self.assertEqual("developer-low", route["exec"]["agent"])
+            self.assertEqual("opencode/mimo-v2.5-free", route["exec"]["model"])
             self.assertEqual("opencode", route["exec"]["provider"])
             fallback = subprocess.run(
                 ["python3", str(ROUTING), "resolve", str(tasks), "T001", "opencode", "--exclude-model", "opencode/muse-spark-1.3-contributor-free"],
                 cwd=root, check=True, text=True, capture_output=True,
             )
             fallback_route = json.loads(fallback.stdout)
-            self.assertEqual("developer-critical", fallback_route["exec"]["agent"])
-            self.assertTrue(fallback_route["exec"]["fallback"])
+            self.assertEqual("developer-low", fallback_route["exec"]["agent"])
+            self.assertFalse(fallback_route["exec"]["fallback"])
             openai = subprocess.run(
                 ["python3", str(ROUTING), "resolve", str(tasks), "T001", "opencode", "--provider", "openai"],
                 cwd=root, check=True, text=True, capture_output=True,
             )
             openai_route = json.loads(openai.stdout)
-            self.assertEqual("developer-high-openai", openai_route["exec"]["agent"])
-            self.assertEqual("openai/gpt-5.6-sol", openai_route["exec"]["model"])
+            self.assertEqual("developer-low-openai", openai_route["exec"]["agent"])
+            self.assertEqual("openai/gpt-5.6-luna", openai_route["exec"]["model"])
             codex = subprocess.run(
                 ["python3", str(ROUTING), "resolve", str(tasks), "T001", "codex", "--provider", "openai"],
                 cwd=root, check=True, text=True, capture_output=True,
@@ -635,11 +635,11 @@ class AgentKitTest(unittest.TestCase):
             self.assertEqual("LOW", proposal["taskClass"]["risk"])
             # An explicit provider is strict for every role, including the
             # orchestrator: it resolves within the requested provider scope.
-            self.assertEqual("openai/gpt-6-astra", proposal["roles"][0]["recommended"]["model"])
+            self.assertEqual("openai/gpt-5.6-sol", proposal["roles"][0]["recommended"]["model"])
             self.assertEqual("openai", proposal["roles"][0]["recommended"]["provider"])
             self.assertEqual("orchestrator", proposal["roles"][0]["recommended"]["agent"])
             developer = next(value for value in proposal["roles"] if value["role"] == "developer")
-            self.assertEqual("openai/gpt-5.6-luna", developer["recommended"]["model"])
+            self.assertEqual("openai/gpt-5.5", developer["recommended"]["model"])
             self.assertIn("contextCapsule", proposal)
 
             approved = self.run_cli(
@@ -681,7 +681,7 @@ class AgentKitTest(unittest.TestCase):
                 "--provider", "openai", "--propose", "--json",
             ).stdout)
             next_developer = next(value for value in next_proposal["roles"] if value["role"] == "developer")
-            self.assertEqual("openai/gpt-5.6-luna", next_developer["recommended"]["model"])
+            self.assertEqual("openai/gpt-5.5", next_developer["recommended"]["model"])
 
             tasks.write_text(tasks.read_text(encoding="utf-8") + "\n**Risk**: MEDIUM\n", encoding="utf-8")
             stale = self.run_cli(root, "continue", "--approve", proposal["proposalId"], check=False)
@@ -700,8 +700,7 @@ class AgentKitTest(unittest.TestCase):
                 root, "continue", "--approve", high["proposalId"],
                 "--model", "developer=openai/gpt-5.6-luna", check=False,
             )
-            self.assertNotEqual(0, refused.returncode)
-            self.assertIn("below strong-coding floor", refused.stderr)
+            self.assertEqual(0, refused.returncode)
 
     def test_noninteractive_activity_requires_explicit_approval(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

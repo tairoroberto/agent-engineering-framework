@@ -16,6 +16,7 @@ from typing import Any
 
 import catalog
 import routing
+from model_router import ModelRouter, NoCapableModel, ROLE_BUDGETS, compress_tool_output
 
 
 RUNTIME = Path(".agent-managed/runtime")
@@ -207,14 +208,13 @@ def catalog_models(lock: dict[str, Any], harness: str, provider: str | set[str])
 
 
 def role_contracts(workflow: str, route: dict[str, Any]) -> list[tuple[str, str, str]]:
-    risk = route["class"]["risk"]
-    qa_class = {"LOW": "qa-basic", "MEDIUM": "qa-targeted", "HIGH": "qa-adversarial", "CRITICAL": "qa-adversarial"}[risk]
-    contracts: list[tuple[str, str, str]] = [("orchestrator", "modelClasses", "strongest-appropriate")]
+    # Complexity/risk change verification and capabilities, not default cost tier.
+    contracts: list[tuple[str, str, str]] = [("orchestrator", "modelClasses", "capability-first")]
     if workflow != "review":
-        contracts.append(("developer", "modelClasses", route["exec"]["modelClass"]))
-    contracts.append(("reviewer", "reviewClasses", "independent-reviewer"))
+        contracts.append(("developer", "modelClasses", "cost-first"))
+    contracts.append(("reviewer", "reviewClasses", "cost-first"))
     if any(value.startswith("qa-") for value in route.get("verify", [])):
-        contracts.append(("qa", "qaClasses", qa_class))
+        contracts.append(("qa", "qaClasses", "cost-first"))
     return contracts
 
 
@@ -253,23 +253,49 @@ def proposal_role(
     floor: str,
     orchestrator_model: str | None,
 ) -> dict[str, Any]:
-    # The orchestrator contract prefers strongest-appropriate but accepts the
-    # strongest suitable control-plane model (strong-coding floor, consistent
-    # with init-time selection): best-available within the provider scope,
-    # never a cross-provider downgrade.
-    floors = [floor]
-    if role == "orchestrator" and family == "modelClasses" and floor == "strongest-appropriate":
-        floors.append("strong-coding")
-    last_error: ValueError | None = None
-    for effective_floor in floors:
-        try:
-            return build_role_contract(
-                root, lock, mapping, harness, provider,
-                role, family, floor, effective_floor, orchestrator_model,
-            )
-        except ValueError as error:
-            last_error = error
-    raise last_error if last_error is not None else ValueError(f"no eligible model for {role}")
+    models = [catalog.descriptor_from_entry(value) for value in catalog_models(lock, harness, provider)]
+    mapped = family_model_routes(mapping, family, provider)
+    # Per-invocation harnesses do not need a generated model-specific adapter.
+    if harness == "opencode":
+        models = [model for model in models if model.model_id in mapped or role == "orchestrator"]
+    if orchestrator_model and role == "orchestrator":
+        models = [model for model in models if model.model_id == orchestrator_model]
+    router = ModelRouter(models)
+    try:
+        decision = router.route(role, provider if isinstance(provider, str) else "auto")
+    except NoCapableModel as error:
+        prefix = "ORCHESTRATOR_UNAVAILABLE: " if role == "orchestrator" else ""
+        raise ValueError(prefix + str(error)) from error
+    alternatives: list[dict[str, Any]] = []
+    for model in models:
+        eligible = model in decision.eligible
+        route_entry = mapped.get(model.model_id, {})
+        estimate = estimate_for(root, harness, model.model_id, model_class({"classes": []}), role)
+        alternatives.append({
+            "model": model.model_id,
+            "provider": model.provider,
+            "class": model.cost_tier.lower(),
+            "costTier": model.cost_tier,
+            "eligible": eligible,
+            "disabledReason": None if eligible else "capability, context, or availability constraint",
+            "agent": "orchestrator" if role == "orchestrator" else route_entry.get("agent", role),
+            "reasoningEffort": "high" if role == "orchestrator" else "low",
+            "estimate": {
+                **estimate,
+                "cost": model.expected_cost(decision.estimated_input_tokens, decision.estimated_output_tokens),
+            },
+        })
+    chosen = next(value for value in alternatives if value["model"] == decision.selected.model_id)
+    return {
+        "role": role,
+        "family": family,
+        "floor": floor,
+        "locked": False,
+        "recommended": chosen,
+        "alternatives": alternatives,
+        "routing": decision.to_dict(),
+        "justification": decision.rationale,
+    }
 
 
 def build_role_contract(
@@ -397,6 +423,14 @@ def create_proposal(
     errors = catalog.validate_catalog(lock, [harness])
     if errors:
         raise ValueError("; ".join(errors))
+    # Project overrides enrich the canonical catalog; routing never contains
+    # provider/model-specific policy itself.
+    overrides = manifest.get("model_metadata")
+    if isinstance(overrides, dict):
+        lock = json.loads(json.dumps(lock))
+        for harness_entry in lock.get("harnesses", {}).values():
+            if isinstance(harness_entry, dict) and isinstance(harness_entry.get("models"), list):
+                harness_entry["models"] = catalog.apply_metadata_overrides(harness_entry["models"], overrides)
     tasks_path, task_id, feature = locate_task(root, target)
     if tasks_path and task_id:
         tasks, execution = routing.parse_tasks(tasks_path)
@@ -526,6 +560,22 @@ def parse_overrides(raw_values: list[str]) -> dict[str, str]:
     return overrides
 
 
+def bounded_context_capsule(capsule: dict[str, Any], role: str) -> dict[str, Any]:
+    """Pass only role-relevant, bounded evidence; canonical artifacts remain references."""
+    budget = ROLE_BUDGETS.get(role, ROLE_BUDGETS["mechanical"])
+    compact = dict(capsule)
+    compact["budget"] = budget
+    compact["artifactReferences"] = [".specs/features/<feature>/state.json", "Developer Closure", "GateReceipt"]
+    failures = compact.get("knownFailures")
+    if isinstance(failures, list):
+        compact["knownFailures"] = [compress_tool_output(str(value), limit=600) for value in failures[:3]]
+    for key in ("acceptanceCriteria", "decisions", "paths", "dependencies", "gates"):
+        value = compact.get(key)
+        if isinstance(value, list):
+            compact[key] = value[:12]
+    return compact
+
+
 def approve_proposal(root: Path, proposal_id: str, override_values: list[str]) -> dict[str, Any]:
     proposal = load_proposal(root, proposal_id)
     if current_inputs(root, proposal) != proposal.get("inputs"):
@@ -562,7 +612,8 @@ def approve_proposal(root: Path, proposal_id: str, override_values: list[str]) -
             "approvedFallbacks": [value["model"] for value in eligible_fallback_routes],
             "fallbackOrder": eligible_fallback_routes,
             "estimate": candidate["estimate"],
-            "contextCapsule": proposal["contextCapsule"],
+            "contextCapsule": bounded_context_capsule(proposal["contextCapsule"], role),
+            "routing": contract.get("routing"),
         })
     plan_id = canonical_hash({"proposalId": proposal_id, "roles": plan_roles, "inputs": proposal["inputs"]})[:20]
     plan = {
@@ -685,6 +736,15 @@ def record_receipt(
         "model": effective_model,
         "modelClass": actual_class,
         "requiredFloor": contract["requiredFloor"],
+        "selectionStrategy": (contract.get("routing") or {}).get("selectionStrategy"),
+        "requiredCapabilities": (contract.get("routing") or {}).get("requiredCapabilities", []),
+        "costTier": next((value.get("costTier") for value in contract.get("fallbackOrder", []) if value.get("model") == effective_model), None),
+        "estimatedInputTokens": (contract.get("routing") or {}).get("estimatedInputTokens"),
+        "estimatedOutputTokens": (contract.get("routing") or {}).get("estimatedOutputTokens"),
+        "estimatedCost": (contract.get("routing") or {}).get("estimatedCost"),
+        "actualCost": cost_microunits,
+        "escalationCount": 0,
+        "escalationReason": None,
         "reasoningEffort": effective_route["reasoningEffort"],
         "inputTokens": input_tokens,
         "outputTokens": output_tokens,
@@ -719,6 +779,8 @@ def record_receipt(
 
 def usage_report(root: Path) -> dict[str, Any]:
     totals: dict[str, dict[str, int]] = {}
+    roles: dict[str, dict[str, int]] = {}
+    providers: dict[str, dict[str, int]] = {}
     paths = [root / RECEIPTS]
     feature_root = root / ".specs" / "features"
     if feature_root.is_dir():
@@ -747,4 +809,13 @@ def usage_report(root: Path) -> dict[str, Any]:
             if isinstance(event.get("costMicrounits"), int):
                 total["costMicrounits"] += event["costMicrounits"]
                 total["costSamples"] += 1
-    return {"schemaVersion": 1, "models": totals, "costUnknown": any(value["costSamples"] < value["runs"] for value in totals.values())}
+            for group, key_name in ((roles, str(event.get("role") or event.get("agent") or "unknown")), (providers, str(event.get("provider") or "unknown"))):
+                grouped = group.setdefault(key_name, {"runs": 0, "inputTokens": 0, "outputTokens": 0, "costMicrounits": 0, "escalations": 0})
+                grouped["runs"] += 1
+                for field in ("inputTokens", "outputTokens", "costMicrounits"):
+                    if isinstance(event.get(field), int):
+                        grouped[field] += event[field]
+                if isinstance(event.get("escalationCount"), int):
+                    grouped["escalations"] += event["escalationCount"]
+    return {"schemaVersion": 1, "models": totals, "roles": roles, "providers": providers,
+            "costUnknown": any(value["costSamples"] < value["runs"] for value in totals.values())}

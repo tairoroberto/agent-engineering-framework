@@ -56,16 +56,28 @@ agent-kit route explain T33 --harness opencode --provider openai
 agent-kit route simulate T33 --harness opencode --provider openai --json
 ```
 
-The lock records harness/provider, model ID, portable classes, capabilities,
-supported effort data when known, context-window data when known, availability,
-price status, source, and a content fingerprint. Missing price is explicit and
-causes token history—not an invented monetary value—to drive cost ordering.
+The lock records normalized `ModelDescriptor` facts: provider/model ID, display
+name, input/output/reasoning price where available, cost tier, coding/review/
+reasoning/tool capability, context/output limits, availability and metadata
+source. Unknown models remain valid catalog entries; project-owned
+`[model_metadata]` overrides can add facts without modifying routing code.
+
+The default policy is intentionally asymmetric:
+
+- Orchestrator: `CAPABILITY_FIRST`, prioritizing reasoning and tool capability,
+  then cost among equivalent candidates.
+- Developer, Planner, Reviewer, QA, Explorer, Researcher, Verifier and
+  mechanical roles: `COST_FIRST`. Capability, tool support and context are
+  constraints; expected execution cost is the optimization target.
+
+When input/output prices are known, selection compares estimated execution cost.
+Otherwise it uses `ECONOMY`, `STANDARD`, then `PREMIUM`. No production routing
+rule depends on a model name.
 
 Classification order is declared task metadata, valid persisted classification,
 then deterministic inference. LOW-confidence inference returns
-`CLASSIFICATION_REQUIRED`. Complexity and risk establish floors; capabilities
-can raise but never reduce them. Metrics reorder candidates only within an
-eligible floor.
+`CLASSIFICATION_REQUIRED`. Complexity and risk establish gates and required
+capabilities; they do not automatically select a premium worker.
 
 ## OpenCode with GitHub Copilot provider
 
@@ -176,6 +188,18 @@ agent-kit usage report --json
 Receipts contain fact-only execution metadata. An unapproved effective model is
 rejected as `MODEL_MISMATCH`. Prompts, transcripts, sessions, reasoning, and
 credentials are not accepted or stored.
+
+Workers receive a low/very-low context and output budget by default. The
+Orchestrator has high context/reasoning and medium output budgets. Capsules pass
+task, acceptance, owned paths, relevant decisions, gates and artifact references
+only. Large command output is reduced to command, exit context, relevant error
+lines and a full-log reference.
+
+Escalation is progressive (`ECONOMY -> STANDARD -> PREMIUM`) and centrally
+validated. It requires evidence such as missing capability/tool support,
+insufficient context, an invalid patch, repeated implementation failure or review
+convergence failure. One repair on the same model and at most two tier
+escalations are allowed; exhausted work uses the existing human escalation path.
 
 On a verified quota, rate-limit, or unavailable-model failure, advance the
 plan's circuit breaker without inventing a route:

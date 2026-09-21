@@ -28,6 +28,7 @@ if str(STATE_DIR) not in sys.path:
 import catalog as model_catalog  # noqa: E402
 import activity as activity_runtime  # noqa: E402
 import environment as environment_runtime  # noqa: E402
+from model_router import ModelRouter, NoCapableModel  # noqa: E402
 
 VERSION = (FRAMEWORK / "VERSION").read_text(encoding="utf-8").strip()
 MAJOR = VERSION.split(".", 1)[0]
@@ -1020,35 +1021,17 @@ def select_orchestrator_model(root: Path, data: dict, catalog: dict, requested: 
             ):
                 fail(f"PROVIDER_MISMATCH: {configured!r} is not in the allowed providers {allowed}")
             fail(f"ORCHESTRATOR_UNAVAILABLE: {configured!r} is not available in control harness {primary}")
-        classes = match.get("classes", [])
-        if not any(value in {"strong-coding", "strongest-appropriate"} for value in classes):
-            fail(f"orchestrator model {configured!r} is below the strong control-plane floor")
+        try:
+            ModelRouter([model_catalog.descriptor_from_entry(match)]).route("orchestrator", str(match["provider"]))
+        except NoCapableModel:
+            fail(f"ORCHESTRATOR_UNAVAILABLE: {configured!r} lacks required reasoning/tools metadata")
         return str(configured)
-    mapping = json.loads((root / HARNESS_DIRS[primary] / "routing.json").read_text(encoding="utf-8"))
-    entry = mapping.get("modelClasses", {}).get("strongest-appropriate", {})
-    candidates = entry.get("candidates") if isinstance(entry, dict) else None
-    options = candidates if isinstance(candidates, list) else [entry]
-    if allowed:
-        options = [
-            option for option in options
-            if isinstance(option, dict) and (option.get("provider") in allowed or "provider" not in option)
-        ]
-    for option in options:
-        if isinstance(option, dict) and any(value.get("id") == option.get("model") for value in available):
-            return str(option["model"])
-    if allowed:
-        eligible = [value for value in available if any(
-            cls in {"strong-coding", "strongest-appropriate"} for cls in (value.get("classes") or [])
-        )]
-        if eligible:
-            by_class = {"strongest-appropriate": 1, "strong-coding": 0}
-            eligible.sort(key=lambda value: (
-                max([by_class.get(cls, -1) for cls in (value.get("classes") or [])], default=-1),
-                str(value.get("id")),
-            ), reverse=True)
-            return str(eligible[0]["id"])
-        fail(f"ORCHESTRATOR_UNAVAILABLE: no allowed {allowed} model meets the strong control-plane floor for {primary}")
-    fail(f"ORCHESTRATOR_UNAVAILABLE: no strongest-appropriate model for control harness {primary}")
+    try:
+        decision = ModelRouter([model_catalog.descriptor_from_entry(value) for value in available]).route("orchestrator", "auto")
+    except NoCapableModel:
+        allowed_text = f" allowed {allowed}" if allowed else ""
+        fail(f"ORCHESTRATOR_UNAVAILABLE: no{allowed_text} model meets reasoning/tools requirements for {primary}")
+    return decision.selected.model_id
 
 
 def persist_orchestrator_model(root: Path, model: str) -> None:
@@ -1859,7 +1842,7 @@ def check_executable_routes(root: Path, data: dict, catalog: dict, allowed: list
         for value in catalog.get("harnesses", {}).get(primary, {}).get("models", [])
         if isinstance(value, dict) and value.get("available", True) and value.get("provider") in allowed
     }
-    for plane, min_rank in (("orchestrator", 2), ("developer", 1)):
+    for plane, min_rank in (("orchestrator", 0), ("developer", 0)):
         runnable = []
         entries = mapping.get("modelClasses", {}) if isinstance(mapping, dict) else {}
         for entry in entries.values():
@@ -1935,6 +1918,18 @@ def command_doctor(args: argparse.Namespace) -> None:
         catalog_errors = [str(error)]
     errors.extend(catalog_errors)
     print(f"MODEL_CATALOG: {'invalid' if catalog_errors else catalog['fingerprint'][:12]}")
+    if catalog is not None and not catalog_errors:
+        for harness_name in data["harnesses"]:
+            entries = catalog.get("harnesses", {}).get(harness_name, {}).get("models", [])
+            if not entries:
+                errors.append(f"NO_MODELS: {harness_name} catalog is empty")
+                continue
+            unknown_pricing = sum(1 for entry in entries if isinstance(entry, dict) and entry.get("costUnknown", True))
+            unknown_reasoning = sum(1 for entry in entries if isinstance(entry, dict) and entry.get("reasoningCapability") == "unknown")
+            if unknown_pricing:
+                warnings.append(f"{harness_name}: pricing metadata unavailable for {unknown_pricing} model(s); cost tier fallback active")
+            if unknown_reasoning:
+                warnings.append(f"{harness_name}: reasoning capability unknown for {unknown_reasoning} model(s); add model_metadata overrides for deterministic ranking")
     policy = manifest_provider(data)
     if policy.get("default") or policy.get("allowed"):
         print(f"PROVIDER: default={policy.get('default')} allowed={policy.get('allowed')} strict={str(policy.get('strict')).lower()}")
@@ -2083,8 +2078,8 @@ def render_environment_actions(actions: tuple[environment_runtime.RepairAction, 
 def project_route_readiness(root: Path, data: dict, catalog: dict | None, allowed: list[str] | None) -> dict[str, bool]:
     """Per-plane executability within the allowed providers, secret-free."""
     planes = {
-        "orchestrator": ("modelClasses", ("strongest-appropriate", "strong-coding"), 2),
-        "developer": ("modelClasses", ("balanced-coding", "strong-coding", "strongest-appropriate", "cost-efficient-coding"), 1),
+        "orchestrator": ("modelClasses", ("strongest-appropriate", "strong-coding", "balanced-coding", "cost-efficient-coding"), 0),
+        "developer": ("modelClasses", ("balanced-coding", "strong-coding", "strongest-appropriate", "cost-efficient-coding"), 0),
         "reviewer": ("reviewClasses", ("independent-reviewer",), 0),
         "qa": ("qaClasses", ("qa-targeted",), 0),
     }

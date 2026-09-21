@@ -30,19 +30,14 @@ If a framework-owned adapter must be restored, `agent-kit sync --replace-managed
 
 `install` registers the framework home in user configuration, never in a consumer repository. `status` reports selected profile/protocol/registry. `diff` is read-only and reports whether managed assets or routing block would change. `env --check` is also read-only: it diagnoses Node.js/npm/npx, ai-memory, Caveman, TLC Spec-Driven, and available harness integrations. Plain `env` previews only known repairs and asks for approval; `env --yes` applies that preview non-interactively. `env --json` emits a structured read-only report and cannot be combined with `--yes`. Managed project-local assets are intentional: current Codex/OpenCode discovery differs, while one agent-kit-generated copy gives both harnesses the same protocol without hard-coded consumer paths or manual copies.
 
-For formal feature tasks, the shared router derives a portable capability class
-from declared metadata, valid persisted classification, or deterministic
-inference. Low-confidence inference blocks instead of silently defaulting to a
-strong model. Each generated harness `routing.json` resolves the floor to local
-agents/models, while `.agent-managed/model-catalog.lock.json` records discovered
-availability and capabilities without placing vendor IDs in shared policy.
-Reviewer and QA use the same provider-aware resolution, rather than fixed
-free-model profiles. Quota, rate-limit, and unavailable-model failures are
-terminal for that child; the orchestrator uses only fallbacks already approved
-in the activity plan. A named provider remains strict; `auto` may use an
-approved provider fallback. If the
-active harness cannot cancel a pending child, dependent work stops and the
-operator cancels it in the harness UI.
+The canonical `ModelRouter` applies one global default: the Orchestrator is
+reasoning/capability-first; every other role is cost-first. Capabilities and
+context are eligibility constraints, then the router selects the lowest expected
+cost model from the current provider catalog. Complexity and risk select gates,
+not premium worker models. `.agent-managed/model-catalog.lock.json` stores
+normalized availability, capability and pricing metadata without vendor IDs in
+the policy. A named provider is strict: no cross-provider fallback is allowed
+unless a project explicitly requests `auto` with more than one allowed provider.
 
 Corporate setups can run OpenCode as the harness with GitHub Copilot as the
 only allowed provider: authenticate via `/connect` inside OpenCode, then
@@ -60,7 +55,9 @@ user approves it or supplies per-role model overrides; these choices never leak
 to another activity. Non-interactive execution requires explicit `--approve`
 or `--yes`. Every role receives a compact `ContextCapsule`, and execution is
 recorded as a fact-only `DispatchReceipt` with model, effort, token/cache/cost,
-result, and gates—never prompts, transcripts, sessions, or reasoning.
+ result, and gates—never prompts, transcripts, sessions, or reasoning. Worker
+ capsules have role budgets and reference canonical artifacts rather than copying
+ state or logs; long tool outputs are compacted to actionable failure evidence.
 
 Use `agent-kit tasks list` to show open tasks from every canonical feature state.
 Add `--feature`, repeated `--status`, `--all`, or `--json` for focused and

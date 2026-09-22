@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.8.0
+
+- Add `agent-kit dispatch run` to launch fresh Codex, OpenCode, Claude Code, and GitHub Copilot sessions from an approved plan.
+- Rebuild role-specific context capsules from current source and state, forwarding current review findings and scoped partial changes to a fresh Developer.
+- Normalize quota, rate-limit, model-unavailable, and context-window failures; advance approved routes and preserve a recoverable capacity wait with retry timing.
+- Allow approved `auto` fallback across configured harnesses while preserving strict named-provider boundaries.
+- Verify effective model receipts and reject an unapproved effective model.
+
 ## 1.7.0
 
 - Add Execution Convergence and Developer Closure to portable task state without introducing a parallel state machine.

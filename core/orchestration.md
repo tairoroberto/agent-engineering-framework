@@ -38,10 +38,12 @@ model, effort, token/cache/cost facts, outcome, gates, and mismatch in a
 credentials. Verified historical consumption may reorder candidates within the
 same floor, but never lower capability, independence, security, or gates.
 
-A quota, rate-limit, or unavailable-model response is terminal for that child:
+A quota, rate-limit, unavailable-model, or context-window response is terminal for that child:
 do not retry it or wait indefinitely. Use only the fallback order already
 approved in the plan. A different fallback requires approval; a named provider
 stays strict and only `auto` may change provider. If the harness cannot cancel a
 pending child, record it as blocked/cancelled, prevent dependent dispatch, and
-tell the operator the exact UI cancellation needed. No candidate means
-execution is blocked while classification and required gates stay unchanged.
+tell the operator the exact UI cancellation needed. The launcher records only
+the failure category and reported retry delay. No candidate creates a
+recoverable capacity wait while classification and required gates stay unchanged;
+it never consumes the code-convergence budget.

@@ -10,6 +10,8 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -24,11 +26,13 @@ PROPOSALS = RUNTIME / "proposals"
 PLANS = RUNTIME / "plans"
 RECEIPTS = RUNTIME / "dispatch-receipts.jsonl"
 CIRCUITS = RUNTIME / "circuits"
+WAITS = RUNTIME / "capacity-waits"
 ROLE_ORDER = ("orchestrator", "developer", "reviewer", "qa")
 CLASS_ORDER = tuple(routing.MODEL_CLASS_ORDER)
 TASK_HEADER_TEMPLATE = r"^###\s+{task}:"
 SAFE_ID = re.compile(r"^[A-Za-z0-9._-]{1,120}$")
 SAFE_RESULT = {"PASS", "FAIL", "DONE", "BLOCKED", "ESCALATED", "CANCELLED"}
+AVAILABILITY_KINDS = {"quota", "rate_limit", "model_unavailable", "context_window"}
 
 
 def now() -> str:
@@ -503,6 +507,21 @@ def create_proposal(
         role["recommended"]["reasoningEffort"] = effort
         for alternative in role["alternatives"]:
             alternative["reasoningEffort"] = effort
+        role["crossHarnessAlternatives"] = []
+        if effective_provider == "auto":
+            for alternate_harness in manifest.get("harnesses", []):
+                if alternate_harness == harness:
+                    continue
+                try:
+                    alternate = proposal_role(
+                        root, lock, load_mapping(root, alternate_harness), alternate_harness, "auto",
+                        role["role"], role["family"], role["floor"], None,
+                    )
+                except ValueError:
+                    continue
+                for candidate in alternate["alternatives"]:
+                    if candidate.get("eligible"):
+                        role["crossHarnessAlternatives"].append({**candidate, "harness": alternate_harness})
     inputs = activity_inputs(root, tasks_path, lock)
     identity = {
         "schemaVersion": 1,
@@ -512,6 +531,7 @@ def create_proposal(
         "task": task_id,
         "harness": harness,
         "provider": effective_provider,
+        "availableHarnesses": list(manifest.get("harnesses", [])),
         "inputs": inputs,
         "roles": [{"role": value["role"], "model": value["recommended"]["model"]} for value in roles],
     }
@@ -576,6 +596,101 @@ def bounded_context_capsule(capsule: dict[str, Any], role: str) -> dict[str, Any
     return compact
 
 
+def current_context_capsule(root: Path, plan: dict[str, Any], role: str) -> dict[str, Any]:
+    """Rebuild a small, fact-only capsule immediately before a fresh run."""
+    tasks_path, task_id, feature = locate_task(root, str(plan["target"]))
+    capsule: dict[str, Any] = {
+        "objective": plan["target"], "acceptanceCriteria": [], "decisions": [],
+        "paths": [], "dependencies": [], "knownFailures": [], "gates": [],
+        "developerClosure": None,
+    }
+    if tasks_path and task_id:
+        tasks, execution = routing.parse_tasks(tasks_path)
+        task = tasks[task_id]
+        state_path = tasks_path.with_name("state.json")
+        current: dict[str, Any] = {}
+        state: dict[str, Any] = {}
+        if state_path.is_file():
+            state = read_json(state_path, "adjacent feature state")
+            candidate = state.get("tasks", {}).get(task_id)
+            if isinstance(candidate, dict):
+                current = candidate
+        complexity, risk, _ = routing.effective_classification(task, current)
+        route = routing.route_task(task, execution, routing.load_policy(), complexity=complexity, risk=risk)
+        convergence = current.get("convergence") if isinstance(current.get("convergence"), dict) else {}
+        closure = convergence.get("developerClosure") if isinstance(convergence, dict) else None
+        capsule.update({
+            "objective": task.title,
+            "acceptanceCriteria": list(task.verification),
+            "paths": [item.removeprefix("file:") for item in task.conflicts if item.startswith("file:")],
+            "dependencies": list(task.dependencies), "gates": route.get("verify", []),
+            "developerClosure": closure,
+            "knownFailures": closure.get("knownFailures", []) if isinstance(closure, dict) else [],
+        })
+        findings = convergence.get("reviewFindings", []) if isinstance(convergence, dict) else []
+        if role == "developer" and isinstance(findings, list):
+            capsule["reviewFindings"] = findings[:12]
+        handoff = state.get("handoff") if isinstance(state.get("handoff"), dict) else {}
+        if handoff:
+            capsule["decisions"] = [str(handoff.get("ads", ""))] if handoff.get("ads") else []
+    try:
+        diff = subprocess.run(
+            ["git", "diff", "--no-ext-diff", "--", *capsule["paths"]], cwd=root,
+            text=True, capture_output=True, timeout=10, check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        diff = ""
+    if diff:
+        capsule["partialChanges"] = compress_tool_output(diff, limit=1200)
+    return bounded_context_capsule(capsule, role)
+
+
+def classify_availability_failure(output: str) -> dict[str, str] | None:
+    """Normalize known provider failures without retaining their raw output."""
+    text = output.lower()
+    if any(token in text for token in ("free usage exceeded", "quota exceeded", "usage limit", "insufficient quota")):
+        kind = "quota"
+    elif any(token in text for token in ("rate limit", "too many requests", "http 429")):
+        kind = "rate_limit"
+    elif any(token in text for token in ("model unavailable", "model_not_found", "unavailable model")):
+        kind = "model_unavailable"
+    elif any(token in text for token in ("context window", "context length", "too many tokens")):
+        kind = "context_window"
+    else:
+        return None
+    retry = re.search(r"(?:retry(?: after| in)?|wait)\s*(\d+)\s*(seconds?|minutes?|hours?)", text)
+    result = {"kind": kind, "scope": "model"}
+    if retry:
+        result["retryAfterSeconds"] = str(int(retry.group(1)) * {"second": 1, "seconds": 1, "minute": 60, "minutes": 60, "hour": 3600, "hours": 3600}[retry.group(2)])
+    return result
+
+
+def reported_effective_model(output: str) -> str | None:
+    """Read an explicit model receipt when a harness emits structured output."""
+    for line in reversed(output.splitlines()):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            value = event.get("effectiveModel") or event.get("model")
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def reduce_context_capsule(capsule: dict[str, Any]) -> dict[str, Any]:
+    """Keep the task boundary when a provider rejects the normal context size."""
+    compact = dict(capsule)
+    for key, limit in (("acceptanceCriteria", 6), ("paths", 6), ("dependencies", 6), ("gates", 6), ("reviewFindings", 6)):
+        if isinstance(compact.get(key), list):
+            compact[key] = compact[key][:limit]
+    compact.pop("partialChanges", None)
+    compact.pop("decisions", None)
+    compact["contextReduced"] = True
+    return compact
+
+
 def approve_proposal(root: Path, proposal_id: str, override_values: list[str]) -> dict[str, Any]:
     proposal = load_proposal(root, proposal_id)
     if current_inputs(root, proposal) != proposal.get("inputs"):
@@ -592,15 +707,24 @@ def approve_proposal(root: Path, proposal_id: str, override_values: list[str]) -
             raise ValueError(f"model {requested!r} refused for {role}: {candidate.get('disabledReason')}")
         if contract.get("locked") and requested != contract["recommended"]["model"]:
             raise ValueError("orchestrator model is locked for this installation; use init --force --orchestrator-model")
-        eligible_fallback_routes = [] if contract.get("locked") else [
+        eligible_fallback_routes = [
             {
                 "model": value["model"], "provider": value["provider"],
                 "agent": value.get("agent", role), "reasoningEffort": value["reasoningEffort"],
-                "modelClass": value["class"],
+                "modelClass": value["class"], "harness": proposal["harness"],
             }
             for value in contract["alternatives"]
             if value.get("eligible") and value["model"] != requested
         ]
+        eligible_fallback_routes.extend(
+            {
+                "model": value["model"], "provider": value["provider"],
+                "agent": value.get("agent", role), "reasoningEffort": value["reasoningEffort"],
+                "modelClass": value["class"], "harness": value["harness"],
+            }
+            for value in contract.get("crossHarnessAlternatives", [])
+            if value.get("model") != requested
+        )
         plan_roles.append({
             "role": role,
             "agent": candidate.get("agent", role),
@@ -608,6 +732,7 @@ def approve_proposal(root: Path, proposal_id: str, override_values: list[str]) -
             "provider": candidate["provider"],
             "reasoningEffort": candidate["reasoningEffort"],
             "modelClass": candidate["class"],
+            "harness": proposal["harness"],
             "requiredFloor": contract["floor"],
             "approvedFallbacks": [value["model"] for value in eligible_fallback_routes],
             "fallbackOrder": eligible_fallback_routes,
@@ -627,29 +752,41 @@ def approve_proposal(root: Path, proposal_id: str, override_values: list[str]) -
         "feature": proposal.get("feature"),
         "task": proposal.get("task"),
         "harness": proposal["harness"],
+        "availableHarnesses": proposal.get("availableHarnesses", [proposal["harness"]]),
         "provider": proposal["provider"],
         "inputs": proposal["inputs"],
         "roles": plan_roles,
         "overrides": overrides,
         "status": "APPROVED",
+        "executionPolicy": {"session": "fresh", "resume": False, "fork": False},
     }
     safe_write_json(root / PLANS / f"{plan_id}.json", plan)
     return plan
 
 
-def load_plan(root: Path, plan_id: str) -> dict[str, Any]:
+def load_plan(root: Path, plan_id: str, *, allow_state_change: bool = False) -> dict[str, Any]:
     if not SAFE_ID.fullmatch(plan_id):
         raise ValueError("invalid plan id")
     plan = read_json(root / PLANS / f"{plan_id}.json", "dispatch plan")
     if plan.get("kind") != "DispatchPlan" or plan.get("planId") != plan_id:
         raise ValueError("invalid dispatch plan")
-    if current_inputs(root, plan) != plan.get("inputs"):
+    current = current_inputs(root, plan)
+    expected = plan.get("inputs", {})
+    compatible = current == expected or (
+        allow_state_change
+        and current.get("tasks") == expected.get("tasks")
+        and current.get("catalog") == expected.get("catalog")
+    )
+    if not compatible:
         raise ValueError("PLAN_STALE: task, state, or catalog changed; approve a new proposal")
     return plan
 
 
-def next_fallback(root: Path, plan_id: str, role: str, failed_model: str) -> dict[str, Any]:
-    plan = load_plan(root, plan_id)
+def next_fallback(
+    root: Path, plan_id: str, role: str, failed_model: str,
+    *, failure: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    plan = load_plan(root, plan_id, allow_state_change=True)
     contract = next((value for value in plan["roles"] if value["role"] == role), None)
     if contract is None:
         raise ValueError(f"role {role!r} is not approved by plan {plan_id}")
@@ -659,13 +796,25 @@ def next_fallback(root: Path, plan_id: str, role: str, failed_model: str) -> dic
     path = root / CIRCUITS / f"{plan_id}.json"
     state = read_json(path, "circuit state") if path.is_file() else {"schemaVersion": 1, "planId": plan_id, "failures": {}}
     failures = state.setdefault("failures", {}).setdefault(role, [])
-    if failed_model not in failures:
-        failures.append(failed_model)
-    replacement = next((model for model in approved if model not in failures), None)
+    failed = next((item for item in failures if item.get("model") == failed_model), None)
+    if failed is None:
+        failed = {"model": failed_model, "at": now()}
+        if failure:
+            failed.update({key: value for key, value in failure.items() if key in {"kind", "scope", "retryAfterSeconds"}})
+        failures.append(failed)
+    failed_models = {item.get("model") for item in failures if isinstance(item, dict)}
+    replacement = next((model for model in approved if model not in failed_models), None)
     state["updatedAt"] = now()
     safe_write_json(path, state)
     if replacement is None:
-        raise ValueError(f"CIRCUIT_OPEN: no approved fallback remains for {role}; create a new proposal")
+        wait = {
+            "schemaVersion": 1, "kind": "CapacityWait", "planId": plan_id,
+            "role": role, "failedModels": sorted(str(value) for value in failed_models),
+            "retryAfterSeconds": failure.get("retryAfterSeconds") if failure else None,
+            "at": now(),
+        }
+        safe_write_json(root / WAITS / f"{plan_id}-{role}.json", {key: value for key, value in wait.items() if value is not None})
+        return {key: value for key, value in wait.items() if value is not None}
     route = next(
         (value for value in contract.get("fallbackOrder", []) if value.get("model") == replacement),
         contract,
@@ -675,12 +824,91 @@ def next_fallback(root: Path, plan_id: str, role: str, failed_model: str) -> dic
         "kind": "ApprovedFallback",
         "planId": plan_id,
         "role": role,
-        "failedModels": failures,
+        "failedModels": [item["model"] for item in failures],
         "model": replacement,
         "provider": route.get("provider", plan["provider"]),
         "agent": route.get("agent", role),
         "reasoningEffort": route.get("reasoningEffort"),
+        "harness": route.get("harness", plan["harness"]),
     }
+
+
+def execution_command(root: Path, route: dict[str, Any], capsule: dict[str, Any]) -> list[str]:
+    """Build only fresh-session commands. Resume and fork never appear here."""
+    payload = json.dumps({"dispatch": "fresh", "capsule": capsule}, ensure_ascii=False)
+    harness = route["harness"]
+    binary = shutil.which(harness if harness != "codex" else "codex")
+    if not binary:
+        raise ValueError(f"HARNESS_UNAVAILABLE: {harness} executable was not found")
+    if harness == "opencode":
+        return [binary, "run", "--format", "json", "--agent", route["agent"], "--model", route["model"], payload]
+    if harness == "codex":
+        return [binary, "exec", "--json", "--model", route["model"], payload]
+    if harness == "claude":
+        return [binary, "--print", "--output-format", "json", "--agent", route["agent"], "--model", route["model"], payload]
+    if harness == "copilot":
+        return [binary, "--prompt", payload, "--agent", route["agent"], "--model", route["model"], "--output-format", "json"]
+    raise ValueError(f"HARNESS_UNSUPPORTED: {harness}")
+
+
+def run_dispatch(root: Path, plan_id: str, role: str, *, dry_run: bool = False, timeout: int = 600) -> dict[str, Any]:
+    """Run a role in a new CLI process and advance only approved fallbacks."""
+    plan = load_plan(root, plan_id, allow_state_change=True)
+    contract = next((item for item in plan["roles"] if item["role"] == role), None)
+    if contract is None:
+        raise ValueError(f"role {role!r} is not approved by plan {plan_id}")
+    route = dict(contract)
+    attempts: list[dict[str, Any]] = []
+    reduce_context = False
+    while True:
+        capsule = current_context_capsule(root, plan, role)
+        if reduce_context:
+            capsule = reduce_context_capsule(capsule)
+        command = execution_command(root, route, capsule)
+        launch = {"harness": route["harness"], "agent": route["agent"], "model": route["model"], "freshSession": True, "command": command[:-1]}
+        if dry_run:
+            return {"schemaVersion": 1, "kind": "FreshDispatch", "planId": plan_id, "role": role, "capsule": capsule, "launch": launch, "attempts": attempts}
+        try:
+            completed = subprocess.run(command, cwd=root, text=True, capture_output=True, timeout=timeout, check=False)
+            output = (completed.stdout + "\n" + completed.stderr).strip()
+        except subprocess.TimeoutExpired:
+            output = "execution timeout"
+            completed = None
+        failure = classify_availability_failure(output)
+        attempts.append({"model": route["model"], "harness": route["harness"], "result": "availability_failure" if failure else "completed"})
+        if failure:
+            fallback = next_fallback(root, plan_id, role, route["model"], failure=failure)
+            if fallback["kind"] == "ApprovedFallback":
+                route = {**contract, **fallback}
+                reduce_context = failure["kind"] == "context_window"
+                continue
+            return {"schemaVersion": 1, "kind": "WaitingForCapacity", "planId": plan_id, "role": role, "wait": fallback, "attempts": attempts}
+        if completed is None or completed.returncode:
+            return {"schemaVersion": 1, "kind": "DispatchFailure", "planId": plan_id, "role": role, "launch": launch, "attempts": attempts, "result": "FAIL"}
+        effective_model = reported_effective_model(output)
+        if effective_model and effective_model != route["model"]:
+            return {"schemaVersion": 1, "kind": "MODEL_MISMATCH", "planId": plan_id, "role": role, "launch": launch, "attempts": attempts, "requestedModel": route["model"], "effectiveModel": effective_model, "result": "FAIL"}
+        receipt = record_receipt(
+            root, plan_id, role, "DONE", effective_model or route["model"],
+            None, None, None, None, [], effective_harness=route["harness"],
+        )
+        wait_path = root / WAITS / f"{plan_id}-{role}.json"
+        if wait_path.exists():
+            wait_path.unlink()
+        return {"schemaVersion": 1, "kind": "DispatchCompleted", "planId": plan_id, "role": role, "launch": launch, "attempts": attempts, "effectiveModel": effective_model or route["model"], "receipt": receipt, "result": "DONE"}
+
+
+def pending_capacity(root: Path, target: str) -> dict[str, Any] | None:
+    """Find a recoverable capacity wait for a later `continue` invocation."""
+    for path in sorted((root / WAITS).glob("*.json")):
+        try:
+            wait = read_json(path, "capacity wait")
+            plan = load_plan(root, str(wait["planId"]), allow_state_change=True)
+        except (KeyError, ValueError):
+            continue
+        if plan.get("target") == target:
+            return wait
+    return None
 
 
 def record_receipt(
@@ -694,8 +922,9 @@ def record_receipt(
     cost_microunits: int | None,
     cache_tokens: int | None,
     gates: list[str],
+    effective_harness: str | None = None,
 ) -> dict[str, Any]:
-    plan = load_plan(root, plan_id)
+    plan = load_plan(root, plan_id, allow_state_change=True)
     contract = next((value for value in plan["roles"] if value["role"] == role), None)
     if contract is None:
         raise ValueError(f"role {role!r} is not approved by plan {plan_id}")
@@ -731,7 +960,7 @@ def record_receipt(
         "task": plan.get("task") or "T000",
         "feature": plan.get("feature"),
         "role": role,
-        "harness": plan["harness"],
+        "harness": effective_harness or plan["harness"],
         "provider": effective_route["provider"],
         "model": effective_model,
         "modelClass": actual_class,

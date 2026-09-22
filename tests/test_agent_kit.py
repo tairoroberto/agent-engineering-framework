@@ -702,6 +702,90 @@ class AgentKitTest(unittest.TestCase):
             )
             self.assertEqual(0, refused.returncode)
 
+    def test_dispatch_run_rebuilds_a_fresh_developer_capsule_with_review_findings(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "consumer"
+            root.mkdir()
+            self.run_cli(root, "init", "--profile", "generic", "--harness", "opencode")
+            feature = root / ".specs" / "features" / "sample"
+            feature.mkdir(parents=True)
+            (feature / "tasks.md").write_text(
+                "### T1: correct the field validation\n**Complexity**: LOW\n**Risk**: LOW\n**Where**: `lib/field.py`\n",
+                encoding="utf-8",
+            )
+            source = root / "lib" / "field.py"
+            source.parent.mkdir()
+            source.write_text("value = 1\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "add", "lib/field.py"], cwd=root, check=True)
+            subprocess.run(["git", "-c", "user.name=tests", "-c", "user.email=tests@example.invalid", "commit", "-qm", "baseline"], cwd=root, check=True)
+            proposal = json.loads(self.run_cli(
+                root, "continue", "T1", "--harness", "opencode", "--provider", "opencode", "--propose", "--json",
+            ).stdout)
+            plan = json.loads(self.run_cli(root, "continue", "--approve", proposal["proposalId"], "--json").stdout)
+            state = {"tasks": {"T1": {"convergence": {"reviewFindings": [
+                {"severity": "MAJOR", "file": "lib/field.py:1", "issue": "required validation missing"}
+            ]}}}}
+            (feature / "state.json").write_text(json.dumps(state), encoding="utf-8")
+            source.write_text("value = 2\n", encoding="utf-8")
+
+            rendered = json.loads(self.run_cli(
+                root, "dispatch", "run", "--plan", plan["planId"], "--role", "developer", "--dry-run", "--json",
+            ).stdout)
+            self.assertTrue(rendered["launch"]["freshSession"])
+            self.assertNotIn("--continue", rendered["launch"]["command"])
+            self.assertNotIn("--fork", rendered["launch"]["command"])
+            self.assertEqual("MAJOR", rendered["capsule"]["reviewFindings"][0]["severity"])
+            self.assertIn("value = 1", rendered["capsule"]["partialChanges"])
+
+    def test_dispatch_run_retries_quota_and_rejects_effective_model_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "consumer"
+            root.mkdir()
+            fake_bin = Path(raw) / "bin"
+            fake_bin.mkdir()
+            counter = Path(raw) / "attempts"
+            self.write_fake_executable(fake_bin, "opencode", (
+                f'if [ ! -f "{counter}" ]; then touch "{counter}"; echo "Free usage exceeded, wait 1 minute"; exit 1; fi\n'
+                'echo "{}"\n'
+            ))
+            env = {**os.environ, "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", "")}
+            self.run_cli(root, "init", "--profile", "generic", "--harness", "opencode", env=env)
+            feature = root / ".specs" / "features" / "sample"
+            feature.mkdir(parents=True)
+            (feature / "tasks.md").write_text("### T1: update a document\n**Complexity**: LOW\n**Risk**: LOW\n", encoding="utf-8")
+            proposal = json.loads(self.run_cli(
+                root, "continue", "T1", "--harness", "opencode", "--provider", "opencode", "--propose", "--json", env=env,
+            ).stdout)
+            plan = json.loads(self.run_cli(root, "continue", "--approve", proposal["proposalId"], "--json", env=env).stdout)
+            result = json.loads(self.run_cli(
+                root, "dispatch", "run", "--plan", plan["planId"], "--role", "developer", "--json", env=env,
+            ).stdout)
+            self.assertEqual("DispatchCompleted", result["kind"])
+            self.assertEqual(2, len(result["attempts"]))
+            self.assertNotIn("capacity-waits", "\n".join(path.as_posix() for path in root.rglob("*")))
+
+            self.write_fake_executable(fake_bin, "opencode", 'echo "{\\"model\\":\\"unapproved/model\\"}"\n')
+            mismatch = json.loads(self.run_cli(
+                root, "dispatch", "run", "--plan", plan["planId"], "--role", "developer", "--json", env=env,
+            ).stdout)
+            self.assertEqual("MODEL_MISMATCH", mismatch["kind"])
+
+            stored = root / ".agent-managed" / "runtime" / "plans" / f"{plan['planId']}.json"
+            constrained = json.loads(stored.read_text(encoding="utf-8"))
+            developer = next(item for item in constrained["roles"] if item["role"] == "developer")
+            developer["approvedFallbacks"] = []
+            developer["fallbackOrder"] = []
+            stored.write_text(json.dumps(constrained), encoding="utf-8")
+            self.write_fake_executable(fake_bin, "opencode", 'echo "Free usage exceeded, wait 2 minutes"; exit 1\n')
+            waiting = json.loads(self.run_cli(
+                root, "dispatch", "run", "--plan", plan["planId"], "--role", "developer", "--json", env=env,
+            ).stdout)
+            self.assertEqual("WaitingForCapacity", waiting["kind"])
+            self.assertEqual("120", waiting["wait"]["retryAfterSeconds"])
+            discovered = json.loads(self.run_cli(root, "continue", "T1", "--json", env=env).stdout)
+            self.assertEqual("CapacityWait", discovered["kind"])
+
     def test_noninteractive_activity_requires_explicit_approval(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "consumer"

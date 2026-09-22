@@ -681,3 +681,28 @@ ou de falta de progresso, a tarefa fica `blocked` e a feature entra em
 `human_escalation`; o operador decide o próximo passo. Falhas externas, como
 quota, ferramenta indisponível ou `EXTERNAL_DIRTY_WORKTREE`, são registradas
 separadamente e não consomem o budget de convergência.
+
+## 12. Execução limpa e recuperação de capacidade
+
+O launcher inicia cada papel em uma sessão nova. Ele não usa `resume`,
+`continue` ou `fork`. A cápsula é refeita antes de cada tentativa com o estado,
+o escopo e o diff atuais. Quando Review ou QA devolvem achados, a próxima rodada
+do Developer recebe somente esse lote, os gates e as alterações parciais atuais.
+
+Depois de aprovar o plano, é possível conferir a execução sem chamar um
+provedor:
+
+```bash
+agent-kit dispatch run --plan <plan-id> --role developer --dry-run --json
+```
+
+Remova `--dry-run` para iniciar o harness previsto no plano. Quota, rate limit,
+modelo indisponível e janela de contexto insuficiente encerram aquela tentativa.
+O launcher tenta a próxima rota já aprovada. Provider nomeado continua estrito;
+somente `--provider auto` pode usar uma rota de outro provider ou harness.
+
+Quando a última rota falhar, o launcher grava uma espera recuperável em
+`.agent-managed/runtime/capacity-waits/`. Se o provedor informou uma espera,
+ela aparece como `retryAfterSeconds`. A tarefa mantém seu estado e seus gates;
+a próxima execução de `dispatch run` tenta novamente sem gastar o orçamento de
+convergência do código.

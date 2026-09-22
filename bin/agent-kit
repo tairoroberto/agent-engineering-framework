@@ -199,7 +199,7 @@ reasoningEffort: {role_effort(resolved_base)}
 ---
 
 Route: harness=opencode provider={execution_provider} model="{model}" role={resolved_base}
-Load the dispatched role capsule, current project AGENTS.md, and only the relevant shared protocol/profile sections.
+Start only from this fresh dispatch. Do not resume, fork, or request an earlier agent conversation. Load the dispatched role capsule, current project AGENTS.md, and only the relevant shared protocol/profile sections.
 {instructions}
 {provider_guard}
 Use Caveman handoffs: facts, paths, requirements, commands, results, risks, open items. Do not invent project commands or business rules.
@@ -213,7 +213,7 @@ model = "{model}"
 model_reasoning_effort = "{effort}"
 sandbox_mode = "{sandbox}"
 developer_instructions = """
-Load the dispatched role capsule, project AGENTS.md, and only relevant shared protocol/profile sections.
+Start only from this fresh dispatch. Do not resume, fork, or request an earlier agent conversation. Load the dispatched role capsule, project AGENTS.md, and only relevant shared protocol/profile sections.
 {instruction}
 Use compact evidence. Never invent project gates, architecture, or domain policy.
 """
@@ -263,7 +263,7 @@ user-invocable: true
 disable-model-invocation: true
 ---
 
-Load the compact role capsule, project AGENTS.md, and only relevant managed protocol sections.
+Start only from this fresh dispatch. Do not resume, fork, or request an earlier agent conversation. Load the compact role capsule, project AGENTS.md, and only relevant managed protocol sections.
 Requested effort is `{effort}` in the approved DispatchPlan; Copilot has no portable agent-frontmatter effort field, so verify the effective execution receipt.
 {restriction}
 Return facts, paths, commands, results, risks, and open items. Never persist reasoning or transcripts.
@@ -282,7 +282,7 @@ effort: {effort}
 tools: {tools}
 {turn_limit}---
 
-Load the compact role capsule, project AGENTS.md, and only relevant managed protocol sections.
+Start only from this fresh dispatch. Do not resume, fork, or request an earlier agent conversation. Load the compact role capsule, project AGENTS.md, and only relevant managed protocol sections.
 {restriction}
 Return compact evidence without transcripts or hidden reasoning.
 '''
@@ -2322,7 +2322,12 @@ def command_activity(args: argparse.Namespace) -> None:
     data = parse_manifest(root)
     os.environ["AGENT_FRAMEWORK_CONSUMER_ROOT"] = str(root)
     try:
-        if args.approve:
+        pending = activity_runtime.pending_capacity(root, args.target) if args.command == "continue" and args.target else None
+        if pending and args.yes:
+            value = activity_runtime.run_dispatch(root, pending["planId"], pending["role"])
+        elif pending:
+            value = {"kind": "CapacityWait", **pending}
+        elif args.approve:
             value = activity_runtime.approve_proposal(root, args.approve, args.model)
         else:
             if not args.target:
@@ -2348,6 +2353,8 @@ def command_activity(args: argparse.Namespace) -> None:
         print(json.dumps(value, indent=2, sort_keys=True))
     elif value.get("kind") == "ModelProposal":
         print_model_proposal(value)
+    elif value.get("kind") == "CapacityWait":
+        print(f"CAPACITY_WAITING: plan={value['planId']} role={value['role']}; rerun continue with --yes to retry")
     else:
         print(f"DISPATCH_PLAN: {value['planId']} APPROVED")
 
@@ -2356,8 +2363,13 @@ def command_dispatch(args: argparse.Namespace) -> None:
     root = Path(args.root).resolve()
     os.environ["AGENT_FRAMEWORK_CONSUMER_ROOT"] = str(root)
     try:
-        if args.dispatch_command == "next-fallback":
-            value = activity_runtime.next_fallback(root, args.plan, args.role, args.failed_model)
+        if args.dispatch_command == "run":
+            value = activity_runtime.run_dispatch(root, args.plan, args.role, dry_run=args.dry_run, timeout=args.timeout)
+        elif args.dispatch_command == "next-fallback":
+            failure = {"kind": args.failure_kind, "scope": "model"} if args.failure_kind else None
+            if failure and args.retry_after is not None:
+                failure["retryAfterSeconds"] = str(args.retry_after)
+            value = activity_runtime.next_fallback(root, args.plan, args.role, args.failed_model, failure=failure)
         else:
             value = activity_runtime.record_receipt(
                 root, args.plan, args.role, args.result, args.effective_model,
@@ -2369,7 +2381,12 @@ def command_dispatch(args: argparse.Namespace) -> None:
     if args.json:
         print(json.dumps(value, indent=2, sort_keys=True))
     elif args.dispatch_command == "next-fallback":
-        print(f"APPROVED_FALLBACK: {value['model']} provider={value['provider']} agent={value['agent']}")
+        if value["kind"] == "ApprovedFallback":
+            print(f"APPROVED_FALLBACK: {value['model']} provider={value['provider']} agent={value['agent']}")
+        else:
+            print(f"WAITING_FOR_CAPACITY: role={args.role} plan={args.plan}")
+    elif args.dispatch_command == "run":
+        print(f"DISPATCH: {value['kind']} role={args.role} plan={args.plan}")
     else:
         print(f"DISPATCH_RECEIPT: {args.plan} {args.role} {args.result}")
 
@@ -2556,7 +2573,15 @@ def main() -> None:
     dispatch_fallback.add_argument("--plan", required=True)
     dispatch_fallback.add_argument("--role", choices=activity_runtime.ROLE_ORDER, required=True)
     dispatch_fallback.add_argument("--failed-model", required=True)
+    dispatch_fallback.add_argument("--failure-kind", choices=tuple(sorted(activity_runtime.AVAILABILITY_KINDS)))
+    dispatch_fallback.add_argument("--retry-after", type=int)
     dispatch_fallback.add_argument("--json", action="store_true")
+    dispatch_run = dispatch_sub.add_parser("run")
+    dispatch_run.add_argument("--plan", required=True)
+    dispatch_run.add_argument("--role", choices=activity_runtime.ROLE_ORDER, required=True)
+    dispatch_run.add_argument("--dry-run", action="store_true", help="render a guaranteed fresh-session launch without executing it")
+    dispatch_run.add_argument("--timeout", type=int, default=600)
+    dispatch_run.add_argument("--json", action="store_true")
     dispatch.set_defaults(func=command_dispatch)
     usage = sub.add_parser("usage")
     usage_sub = usage.add_subparsers(dest="usage_command", required=True)

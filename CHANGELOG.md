@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.9.0
+
+- Add shadow-only Decision Plane contracts, policy, audit, and loop lifecycle: the plane observes and records without changing dispatched execution or routing.
+- Add the official TypeSafe/Jev HTTP provider with environment-only key resolution, strict bounded transport, and deterministic fallback behavior.
+- Ship safe Decision Plane manifest defaults and documentation, and validate consumer sync against them.
+- Add additive, backed-up, idempotent `agent-kit sync --update-manifest` migration that preserves existing project values and requires explicit manual activation.
+
 ## 1.8.0
 
 - Add `agent-kit dispatch run` to launch fresh Codex, OpenCode, Claude Code, and GitHub Copilot sessions from an approved plan.

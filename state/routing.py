@@ -28,7 +28,15 @@ FRAMEWORK_ROOT = SCRIPT_DIR.parent
 REFERENCE_DIR = FRAMEWORK_ROOT / "skills" / "engineering-protocol" / "references"
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
-import state as state_tool  # noqa: E402
+try:
+    from . import state as state_tool  # noqa: E402
+except ImportError:
+    import importlib.util
+    _state_spec = importlib.util.spec_from_file_location("agent_state_runtime", SCRIPT_DIR / "state.py")
+    if _state_spec is None or _state_spec.loader is None:
+        raise ImportError("cannot load state runtime")
+    state_tool = importlib.util.module_from_spec(_state_spec)
+    _state_spec.loader.exec_module(state_tool)
 
 COMPLEXITIES = ("LOW", "MEDIUM", "HIGH")
 RISKS = ("LOW", "MEDIUM", "HIGH", "CRITICAL")

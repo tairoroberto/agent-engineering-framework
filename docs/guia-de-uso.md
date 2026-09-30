@@ -233,6 +233,44 @@ agent-kit sync --replace-managed
 
 O conteúdo substituído recebe backup em `.agent-managed/backups/`.
 
+### `sync --update-manifest`: completar um manifesto antigo
+
+O `sync` puro nunca edita `.agent-framework.toml`. Se o projeto foi criado antes
+do Decision Plane, a opção abaixo preenche o que falta:
+
+```bash
+agent-kit sync --update-manifest
+```
+
+O comportamento é aditivo e por seção:
+
+- Preenche apenas chaves e tabelas ausentes de `[decision]`, `[decision.jev]`,
+  `[decision.policy]` e `[decision.context]`, usando o template do framework.
+- Preserva byte a byte valores, comentários, ordem das chaves, seções não
+  relacionadas e o estilo de quebra de linha do arquivo (LF ou CRLF).
+- Nunca ativa o Jev: um `enabled` ausente é sempre gravado como `false`, um
+  `enabled = true` existente é preservado, e nenhuma credencial é lida ou escrita.
+- Recusa, antes de qualquer escrita gerenciada, seção `[decision*]` duplicada,
+  chave duplicada, chave não canônica dentro de uma seção gerenciada, tipo de
+  valor incompatível, valor no lugar de tabela e TOML malformado. Nesse caso o
+  `sync` inteiro aborta sem tocar no manifesto nem nos assets gerenciados.
+- Quando há mudança, grava um backup único e exato em
+  `.agent-managed/backups/agent-framework.toml.before-update-manifest`, escreve de
+  forma atômica, revalida o resultado e imprime `MANIFEST: updated` ou
+  `MANIFEST: unchanged`, seguindo com o sync normal.
+- Repetir o comando não muda mais nada.
+
+A ativação continua sendo manual. Depois do preenchimento, edite o manifesto:
+
+```toml
+[decision]
+enabled = true
+providers = ["jev", "deterministic-safe"]
+```
+
+e exporte `TYPESAFE_API_KEY` no ambiente. Detalhes em
+[docs/model-routing-and-installation.md](model-routing-and-installation.md).
+
 ## 5. Projeto existente: reinstalação com `init --force`
 
 Use `--force` quando a instalação estiver incompleta, corrompida ou quando for

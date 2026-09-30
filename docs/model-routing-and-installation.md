@@ -234,3 +234,201 @@ Adapter formats track the official references: [OpenCode agents](https://opencod
 [Codex subagents](https://developers.openai.com/codex/multi-agent),
 [Copilot custom agents](https://docs.github.com/en/copilot/reference/custom-agents-configuration),
 and [Claude Code subagents](https://code.claude.com/docs/en/sub-agents).
+
+## Decision Plane: bounded shadow observation
+
+The optional Decision Plane is disabled by default and accepts only `disabled` or
+`shadow` mode. It observes the deterministic workflow after task/state
+reconciliation and before the existing proposal is built; its recommendation
+never changes state, gates, convergence, roles, proposal identity, approval,
+fallback order, model selection, harness commands, or dispatch. OpenCode, Codex,
+Copilot, and Claude Code use the same core contracts; adapters do not implement
+decision policy.
+
+### Configuration defaults and bounds
+
+The manifest contract is:
+
+```toml
+[decision]
+enabled = false
+mode = "shadow"
+providers = ["deterministic-safe"]
+audit_path = ".agent-managed/runtime/decision-audit.jsonl"
+
+[decision.policy]
+minimum_confidence = 0.70
+reasoning_probability = 0.70
+review_probability = 0.60
+qa_probability = 0.60
+escalation_probability = 0.70
+
+[decision.context]
+max_questions = 12
+max_metadata_facts = 32
+max_text_chars = 2000
+max_bytes = 16384
+```
+
+`audit_path` must be a non-empty relative project path and cannot contain `..`.
+All context bounds are positive integers, cannot exceed the values above, and
+`max_questions` cannot be below the 12-question schema. Policy thresholds are
+finite numbers in the inclusive range `0..1`. Provider names must be unique and
+are limited to `deterministic-safe`, `mock`, and `jev`.
+
+The bounded context contains an objective, declared requirements, and compact
+scalar facts from task, route, and current state. It excludes `prompt`,
+`transcript`, `reasoning`, `session`, and similar raw conversation fields.
+Strings are capped, metadata is capped, and canonical serialized context is
+bounded to 16 KiB; truncation is deterministic and unsafe values are rejected.
+
+Audit is fact-only. Pre records require `feature`, `task`, `provider`, `profile`,
+`confidence`, `policyRecommendation`, `authoritativeDecision`, `usage`, and
+`mismatch`. Post records require `correlationId`, `eventualResult`,
+`comparison`, `usage`, `model`, and `orphanedPreObservation`. Records are
+bounded to 64 fields/items and 16 KiB. They exclude prompts, payloads,
+requests/responses, transcripts, reasoning, sessions, credentials, secrets,
+full diffs, and raw logs. Runtime files are
+`.agent-managed/runtime/decision-observations/<correlation-id>.json` and
+`.agent-managed/runtime/decision-audit.jsonl`; they are not canonical state.
+
+### Schema, profile, and policy are separate
+
+The **schema** is the vendor-neutral question contract: choice, score, and
+probability questions with validation and canonical serialization. The
+**profile** is the normalized `TaskDecisionProfile`: typed answers carrying
+status (`ANSWERED`, `UNKNOWN`, or `UNSUPPORTED`), provider ID, value, and
+confidence. Provider-specific fields and payloads do not survive normalization.
+The **policy** is a pure evaluator over that profile plus deterministic facts;
+it returns an immutable recommendation with execution tier, model-class floor,
+review/QA/escalation flags, and reason codes. Policy does not select a provider
+or model and performs no I/O.
+
+Required profile answers below `minimum_confidence`, missing answers, or
+unsupported answers are conservative evidence: policy recommends Orchestrator
+escalation and does not weaken review, QA, or execution floors.
+
+### Tiers, precedence, and existing routing
+
+Execution tiers map exactly to existing portable model classes:
+
+| Decision tier | Existing model class |
+| --- | --- |
+| `ECONOMY` | `cost-efficient-coding` |
+| `BALANCED` | `balanced-coding` |
+| `REASONING` | `strong-coding` |
+| `FRONTIER` | `strongest-appropriate` |
+
+Precedence is deterministic and monotonic: explicit task metadata and
+deterministic risk, required review/QA, gate failures, and convergence stops
+establish floors first; semantic probability/confidence may recommend stronger
+handling; semantic evidence can never lower a deterministic floor. Complexity
+and risk select gates and safety floors, not a premium worker model. The
+existing `ModelRouter` then applies capability constraints and its established
+strategy (Orchestrator `CAPABILITY_FIRST`; other roles `COST_FIRST`) against the
+current catalog.
+
+### Provider contract, chain, and Jev boundary
+
+Every provider implements `capabilities()` and `evaluate(request)`. Capabilities
+declare a stable provider ID, supported decision kinds, status
+(`AVAILABLE`, `UNAVAILABLE`, or `UNSUPPORTED`), maximum request bytes, and
+optional usage/model reporting. The chain tries configured providers once, in
+order, validates each normalized result, records compact failure categories
+(`unavailable`, `unsupported`, `timeout`, `error`, `invalid`, or `oversized`),
+and falls through. A deterministic-safe provider is always appended as the
+terminal provider; it copies only authoritative known task classifications and
+returns explicit unknown semantic answers.
+
+`jev` is an explicit, shadow-only HTTP provider. It is disabled by default;
+the deterministic provider remains the terminal fallback. To opt in manually,
+keep the Decision Plane in shadow mode and configure:
+
+```toml
+[decision]
+enabled = true
+mode = "shadow"
+providers = ["jev", "deterministic-safe"]
+
+[decision.jev]
+endpoint = "https://api.typesafe.ai/v1/systemone"
+model = "jev-latest"
+timeout = 10.0
+```
+
+Set `TYPESAFE_API_KEY` in the process environment. The key is environment-only:
+it is never placed in the manifest, source, payload, logs, receipts, or audit
+records. The endpoint is validated before reading the API key or making a
+network call: it must use HTTPS, include a host, and contain no userinfo,
+query, or fragment. The configured HTTPS proxy or test origin is the transport
+trust boundary; redirects are not followed.
+
+The official request uses bounded canonical state and canonical Choice, Score,
+and Noul question shapes. Responses normalize into the central profile. Score
+validates the fractional expected index, probabilities, and legend, then rounds
+to the nearest central-scale position; an exact `.5` rounds toward the higher
+(more conservative) position and the central result is an integer scale value.
+Noul preserves the central `noul` probability and derives confidence exactly as
+`abs(2 * noul - 1)`. Provider output is non-authoritative: Jev cannot alter
+routing, approval, state, gates, fallback order, or model selection.
+
+The adapter makes exactly one attempt and performs zero retries. HTTP 401, 429,
+and 529 map to `unavailable`; 422 maps to `invalid`; timeouts map to `timeout`;
+and other transport or response failures map to `error`. Every failure falls
+through to `deterministic-safe`. Audit output is fact-only and excludes
+credentials, `Authorization`, request/response payloads and bodies, raw
+probabilities, legends, and remote error text. Only bounded safe metadata such
+as model, token counts, and latency may be recorded.
+
+After upgrading a consumer with `agent-kit sync`, the managed runtime and
+documentation receive this Jev implementation. Sync does not modify the
+project-owned `.agent-framework.toml`; operators must manually opt in through
+the configuration above and provide `TYPESAFE_API_KEY` in the environment.
+
+### Filling a legacy manifest: `sync --update-manifest`
+
+A project whose manifest predates the Decision Plane can adopt the canonical
+structure without hand-editing TOML:
+
+```bash
+agent-kit sync --update-manifest
+```
+
+The flag is additive and section-aware. For `[decision]`, `[decision.jev]`,
+`[decision.policy]`, and `[decision.context]` it fills only what is missing, from
+`templates/agent-framework.toml`:
+
+- Every existing value, comment, key order, unrelated section, and the file's
+  newline style (LF or CRLF) is preserved byte for byte.
+- A whole missing table is appended in canonical order; a partial table receives
+  only its missing keys.
+- It never enables Jev. A missing `[decision] enabled` is always written as
+  `false`, an existing `enabled = true` is left untouched, and no credential,
+  key, token, or `.env` value is read, generated, or written anywhere.
+- Before any managed write it rejects a duplicate `[decision*]` header, a
+  duplicate key inside a managed section, a non-canonical key inside one, a
+  value whose type differs from the template's, a value used where a table is
+  required, and malformed TOML. The whole sync aborts and leaves the manifest and
+  managed assets untouched.
+- On change it writes the previous bytes once to
+  `.agent-managed/backups/agent-framework.toml.before-update-manifest`, writes
+  atomically, reparses and validates the complete result (all canonical keys and
+  tables present exactly once), then prints `MANIFEST: updated`. An unchanged
+  manifest prints `MANIFEST: unchanged`. Sync continues in both cases.
+
+Because the fill is inert, activation is still a deliberate manual step:
+
+```toml
+[decision]
+enabled = true
+providers = ["jev", "deterministic-safe"]
+```
+
+then export `TYPESAFE_API_KEY` in the environment. Nothing in the sync path
+reads it for you.
+
+A future LLM adapter must reuse the central schema/profile/provider contracts,
+the existing catalog and `ModelRouter`, and the existing proposal/approval
+flow. It must not hardcode model IDs, create a second registry, bypass
+approval, or invent a parallel provider-discovery path. Paid/model-backed
+pre-proposal calls require a separately approved cost and security contract.

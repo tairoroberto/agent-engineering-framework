@@ -1,0 +1,1 @@
+{"invalid":[{"decision":{"enabled":"yes"}},{"decision":{"unknown":true}},{"decision":{"audit_path":"../audit.jsonl"}},{"decision":{"context":{"max_bytes":"128"}}},{"decision":{"policy":{"minimum_confidence":"high"}}},{"decision":{"providers":["jev","jev"]}}]}

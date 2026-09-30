@@ -1,0 +1,14 @@
+{
+  "cases": [
+    {"name":"default","profile":{},"facts":{},"expect":{"tier":"ECONOMY","class":"cost-efficient-coding","invoke":false,"review":false,"qa":false,"stop":false,"reasons":[]}},
+    {"name":"reasoning-threshold","profile":{"reasoning":0.7},"facts":{},"expect":{"tier":"REASONING","class":"strong-coding","invoke":false,"review":false,"qa":false,"stop":false,"reasons":["reasoning-needed"]}},
+    {"name":"low-confidence","profile":{"reasoning":0.9,"reasoning_confidence":0.69},"facts":{},"expect":{"tier":"BALANCED","class":"balanced-coding","invoke":true,"review":false,"qa":false,"stop":true,"reasons":["incomplete-or-low-confidence-profile","orchestrator-escalation"]}},
+    {"name":"risk-and-complexity","profile":{},"facts":{"risk":"CRITICAL","complexity":"HIGH"},"expect":{"tier":"REASONING","class":"strong-coding","invoke":false,"review":false,"qa":false,"stop":false,"reasons":["deterministic-risk","deterministic-complexity"]}},
+    {"name":"required-review-qa","profile":{},"facts":{"require_review":true,"require_qa":true},"expect":{"tier":"BALANCED","class":"balanced-coding","invoke":false,"review":true,"qa":true,"stop":false,"reasons":["required-review","required-qa"]}},
+    {"name":"gate-failure","profile":{},"facts":{"gate_failed":true},"expect":{"tier":"REASONING","class":"strong-coding","invoke":true,"review":false,"qa":false,"stop":true,"reasons":["gate-failure","orchestrator-escalation"]}},
+    {"name":"convergence-stop","profile":{},"facts":{"convergence_stop":true},"expect":{"tier":"FRONTIER","class":"strongest-appropriate","invoke":true,"review":false,"qa":false,"stop":true,"reasons":["convergence-stop","orchestrator-escalation"]}},
+    {"name":"answer-thresholds","profile":{"review":0.6,"qa":0.6,"escalation":0.7},"facts":{},"expect":{"tier":"ECONOMY","class":"cost-efficient-coding","invoke":true,"review":true,"qa":true,"stop":true,"reasons":["orchestrator-escalation"]}}
+    ,{"name":"low-review-confidence","profile":{"review":0.6,"review_confidence":0.69},"facts":{},"expect":{"tier":"BALANCED","class":"balanced-coding","invoke":true,"review":true,"qa":false,"stop":true,"reasons":["incomplete-or-low-confidence-profile","orchestrator-escalation"]}}
+    ,{"name":"low-qa-confidence","profile":{"qa":0.6,"qa_confidence":0.69},"facts":{},"expect":{"tier":"BALANCED","class":"balanced-coding","invoke":true,"review":false,"qa":true,"stop":true,"reasons":["incomplete-or-low-confidence-profile","orchestrator-escalation"]}}
+  ]
+}

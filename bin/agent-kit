@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import shlex
 import shutil
@@ -23,19 +24,22 @@ except ModuleNotFoundError:  # pragma: no cover
 
 FRAMEWORK = Path(__file__).resolve().parents[1]
 STATE_DIR = FRAMEWORK / "state"
-if str(STATE_DIR) not in sys.path:
-    sys.path.insert(0, str(STATE_DIR))
-import catalog as model_catalog  # noqa: E402
-import activity as activity_runtime  # noqa: E402
-import environment as environment_runtime  # noqa: E402
-from model_router import ModelRouter, NoCapableModel  # noqa: E402
+for _path in (str(FRAMEWORK), str(STATE_DIR)):
+    while _path in sys.path:
+        sys.path.remove(_path)
+sys.path.insert(0, str(FRAMEWORK))
+from state import catalog as model_catalog  # noqa: E402
+from state import activity as activity_runtime  # noqa: E402
+from state import environment as environment_runtime  # noqa: E402
+from state.model_router import ModelRouter, NoCapableModel  # noqa: E402
+sys.modules.setdefault("activity", activity_runtime)
 
 VERSION = (FRAMEWORK / "VERSION").read_text(encoding="utf-8").strip()
 MAJOR = VERSION.split(".", 1)[0]
 MARKER_START = "<!-- agent-framework:start -->"
 MARKER_END = "<!-- agent-framework:end -->"
 MANAGED_REL = Path(".agent-managed/agent-engineering-framework")
-ASSET_DIRS = ("core", "agents", "harness", "profiles", "skills", "state", "workflows")
+ASSET_DIRS = ("core", "agents", "harness", "profiles", "skills", "state", "workflows", "docs")
 COMMAND_MARKER_START = "<!-- agent-framework-command:start"
 COMMAND_MARKER_END = "<!-- agent-framework-command:end -->"
 WORKFLOWS = {
@@ -648,13 +652,18 @@ def load_toml(path: Path) -> dict:
 
 
 def load_flat_toml(path: Path) -> dict:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        fail(f"cannot read TOML {path}: {error}")
+    return parse_flat_toml_text(text, str(path))
+
+
+def parse_flat_toml_text(text: str, label: str) -> dict:
     """Parse framework's deliberately small TOML subset on Python <3.11."""
     data: dict = {}
     node = data
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as error:
-        fail(f"cannot read TOML {path}: {error}")
+    lines = text.splitlines()
     for number, raw in enumerate(lines, 1):
         line = raw.split("#", 1)[0].strip()
         if not line:
@@ -667,12 +676,18 @@ def load_flat_toml(path: Path) -> dict:
             continue
         match = re.fullmatch(r"([A-Za-z0-9_-]+)\s*=\s*(.+)", line)
         if not match:
-            fail(f"invalid TOML {path}:{number}")
+            fail(f"invalid TOML {label}:{number}")
         key, raw_value = match.groups()
         if raw_value in {"true", "false"}:
             value: object = raw_value == "true"
         elif re.fullmatch(r'"(?:[^"\\]|\\.)*"', raw_value):
             value = raw_value[1:-1]
+        elif re.fullmatch(r"[+-]?\d+", raw_value):
+            value = int(raw_value)
+        elif re.fullmatch(r"[+-]?(?:(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?|\d+[eE][+-]?\d+)", raw_value):
+            value = float(raw_value)
+            if not math.isfinite(value):
+                fail(f"unsupported non-finite TOML float {label}:{number}")
         elif raw_value.startswith("[") and raw_value.endswith("]"):
             items = raw_value[1:-1].strip()
             if not items:
@@ -680,10 +695,10 @@ def load_flat_toml(path: Path) -> dict:
             else:
                 values = [part.strip() for part in items.split(",")]
                 if any(not re.fullmatch(r'"(?:[^"\\]|\\.)*"', item) for item in values):
-                    fail(f"unsupported TOML array {path}:{number}")
+                    fail(f"unsupported TOML array {label}:{number}")
                 value = [item[1:-1] for item in values]
         else:
-            fail(f"unsupported TOML value {path}:{number}")
+            fail(f"unsupported TOML value {label}:{number}")
         node[key] = value
     return data
 
@@ -788,6 +803,285 @@ def replace_manifest_value(text: str, key: str, value: str) -> str:
     if pattern.search(text):
         return pattern.sub(f"{key} = {value}", text, count=1)
     return f"{key} = {value}\n{text}"
+
+
+MANIFEST_DECISION_SECTIONS = ("decision", "decision.jev", "decision.policy", "decision.context")
+MANIFEST_UPDATE_BACKUP = "agent-framework.toml.before-update-manifest"
+MANIFEST_CREDENTIAL_KEY = re.compile(r"(?i)(api[_-]?key|secret|token|password|credential|auth)")
+# `sync --update-manifest` fills structure; it never opts a project into a
+# paid provider, so a missing `enabled` is always materialized as false.
+MANIFEST_NEVER_ENABLE = ("decision", "enabled")
+
+
+def toml_line_ending(lines: list[str]) -> str:
+    """Project newline style, CRLF when any line uses it."""
+    return "\r\n" if any(line.endswith("\r\n") for line in lines) else "\n"
+
+
+def toml_blocks(lines: list[str]) -> list[tuple[str | None, list[str]]]:
+    """Split TOML text into (section_name, lines) blocks; None is the preamble."""
+    blocks: list[tuple[str | None, list[str]]] = []
+    name: str | None = None
+    current: list[str] = []
+    for line in lines:
+        header = re.fullmatch(r"\s*\[([^\[\]]+)\]\s*", line)
+        if header:
+            blocks.append((name, current))
+            name = header.group(1).strip()
+            current = [line]
+            continue
+        current.append(line)
+    blocks.append((name, current))
+    return blocks
+
+
+def strip_toml_comment(value: str) -> str:
+    """Drop a trailing `#` comment that is not inside a quoted string."""
+    in_string = False
+    escaped = False
+    for index, character in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\" and in_string:
+            escaped = True
+        elif character == '"':
+            in_string = not in_string
+        elif character == "#" and not in_string:
+            return value[:index].rstrip()
+    return value.rstrip()
+
+
+def toml_assignment(line: str) -> tuple[str, str] | None:
+    """Return (key, comment-stripped raw value) for a bare top-level assignment line."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_-]*)\s*=\s*(.+)", stripped)
+    if match is None:
+        return None
+    key, raw = match.groups()
+    return key, strip_toml_comment(raw)
+
+
+def toml_value_kind(raw: str) -> str:
+    """Coarse value kind used for compatibility checks between merge targets."""
+    raw = raw.strip()
+    if raw in {"true", "false"}:
+        return "boolean"
+    if re.fullmatch(r'"(?:[^"\\]|\\.)*"', raw):
+        return "string"
+    if raw.startswith("[") and raw.endswith("]"):
+        return "array"
+    if re.fullmatch(r"[+-]?\d+", raw):
+        return "integer"
+    if re.fullmatch(r"[+-]?(?:(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?|\d+[eE][+-]?\d+)", raw):
+        return "float"
+    return "unsupported"
+
+
+def parse_toml_text(text: str, label: str) -> dict:
+    """Parse TOML from memory so merge results validate before any write."""
+    if tomllib is not None:
+        try:
+            return tomllib.loads(text)
+        except tomllib.TOMLDecodeError as error:
+            fail(f"invalid TOML {label}: {error}")
+    return parse_flat_toml_text(text, label)
+
+
+def canonical_manifest_decisions() -> dict[str, dict[str, str]]:
+    """Canonical `[decision*]` keys and raw values taken from the shipped template."""
+    template = (FRAMEWORK / "templates/agent-framework.toml").read_text(encoding="utf-8")
+    canonical: dict[str, dict[str, str]] = {}
+    for name, block in toml_blocks(template.splitlines(keepends=True)):
+        if name not in MANIFEST_DECISION_SECTIONS:
+            continue
+        keys: dict[str, str] = {}
+        for line in block[1:]:
+            assignment = toml_assignment(line)
+            if assignment is None:
+                continue
+            key, raw = assignment
+            if key in keys:
+                fail(f"template [{name}] has duplicate key {key!r}")
+            if MANIFEST_CREDENTIAL_KEY.search(key):
+                fail(f"template [{name}] declares credential key {key!r}; refusing to sync credentials")
+            keys[key] = raw.strip()
+        canonical[name] = keys
+    absent = [name for name in MANIFEST_DECISION_SECTIONS if name not in canonical]
+    if absent:
+        fail("template .agent-framework.toml lacks canonical sections: " + ", ".join(absent))
+    return canonical
+
+
+def manifest_decision_value(section: str, key: str, value: str) -> str:
+    """Fill values, forcing `enabled` to false so a fill can never activate Jev."""
+    return "false" if (section, key) == MANIFEST_NEVER_ENABLE else value
+
+
+def check_manifest_decision_structure(
+    blocks: list[tuple[str | None, list[str]]], canonical: dict[str, dict[str, str]]
+) -> tuple[dict[str, list[str]], dict[str, dict[str, str]]]:
+    """Reject duplicate/incompatible `[decision*]` targets; return sections and present keys.
+
+    Runs before any managed write so a malformed manifest never leaves partial state.
+    """
+    sections: dict[str, list[str]] = {}
+    for name, block in blocks:
+        if name is not None and name not in canonical:
+            continue
+        for line in block[1:] if name is not None else block:
+            assignment = toml_assignment(line)
+            if assignment is None:
+                continue
+            key = assignment[0]
+            parent = name or ""
+            child = name.rsplit(".", 1)[0] if name and "." in name else ""
+            if name is None and key in {section.split(".")[0] for section in canonical}:
+                fail(
+                    f".agent-framework.toml defines {key!r} as a value; "
+                    "sync --update-manifest needs a [decision] table"
+                )
+            if child and parent in canonical and key in {
+                part.split(".")[-1] for part in canonical if part.startswith(f"{parent}.")
+            }:
+                fail(
+                    f".agent-framework.toml defines {name}.{key} as a value; "
+                    f"sync --update-manifest needs a [{name}] table"
+                )
+        if name in canonical:
+            if name in sections:
+                fail(f".agent-framework.toml has duplicate [{name}]; resolve it before sync --update-manifest")
+            sections[name] = block
+    present: dict[str, dict[str, str]] = {}
+    for name, block in sections.items():
+        expected = canonical[name]
+        keys: dict[str, str] = {}
+        for line in block[1:]:
+            assignment = toml_assignment(line)
+            if assignment is None:
+                continue
+            key, raw = assignment
+            if key in keys:
+                fail(f".agent-framework.toml has duplicate key {name}.{key}; resolve it before sync --update-manifest")
+            if key not in expected:
+                fail(
+                    f".agent-framework.toml [{name}] has non-canonical key {key!r}; "
+                    "move it out of the managed section before sync --update-manifest"
+                )
+            if toml_value_kind(raw) != toml_value_kind(expected[key]):
+                fail(
+                    f".agent-framework.toml [{name}] {key} is {toml_value_kind(raw)}, "
+                    f"template expects {toml_value_kind(expected[key])}; "
+                    "incompatible target structure for sync --update-manifest"
+                )
+            keys[key] = raw.strip()
+        present[name] = keys
+    return sections, present
+
+
+def validate_manifest_decisions(text: str, canonical: dict[str, dict[str, str]]) -> None:
+    """Validate the complete merge result: parseable TOML plus every canonical key/table."""
+    data = parse_toml_text(text, ".agent-framework.toml")
+    counts: dict[str, int] = {}
+    for name, _ in toml_blocks(text.splitlines(keepends=True)):
+        if name in canonical:
+            counts[name] = counts.get(name, 0) + 1
+    for name, keys in canonical.items():
+        if counts.get(name) != 1:
+            fail(f".agent-framework.toml result has {counts.get(name, 0)} [{name}] sections; expected exactly one")
+        node: object = data
+        for part in name.split("."):
+            if not isinstance(node, dict) or part not in node:
+                fail(f".agent-framework.toml result is missing [{name}]")
+            node = node[part]
+        if not isinstance(node, dict):
+            fail(f".agent-framework.toml result has incompatible [{name}] structure")
+        for key in keys:
+            if key not in node:
+                fail(f".agent-framework.toml result is missing {name}.{key}")
+
+
+def merge_manifest_decisions(text: str, canonical: dict[str, dict[str, str]]) -> tuple[str, bool]:
+    """Additively fill missing canonical `[decision*]` keys/tables, byte-preserving otherwise."""
+    lines = text.splitlines(keepends=True)
+    eol = toml_line_ending(lines)
+    blocks = toml_blocks(lines)
+    sections, present = check_manifest_decision_structure(blocks, canonical)
+    for name in MANIFEST_DECISION_SECTIONS:
+        if name not in sections:
+            continue
+        expected = canonical[name]
+        missing = [key for key in expected if key not in present[name]]
+        if not missing:
+            continue
+        block = sections[name]
+        insert_at = 1
+        for index, line in enumerate(block):
+            if toml_assignment(line) is not None:
+                insert_at = index + 1
+        additions = [
+            f"{key} = {manifest_decision_value(name, key, expected[key])}{eol}" for key in missing
+        ]
+        block[insert_at:insert_at] = additions
+    merged = "".join(line for _, block in blocks for line in block)
+    appended = [
+        name for name in MANIFEST_DECISION_SECTIONS if name not in sections
+    ]
+    if appended:
+        if merged and not merged.endswith("\n"):
+            merged = merged[:-1] if merged.endswith("\r") else merged + eol
+        while merged.endswith(eol + eol):
+            merged = merged[: -len(eol)]
+        chunks = []
+        for name in appended:
+            chunks.append(eol)
+            chunks.append(f"[{name}]{eol}")
+            for key, value in canonical[name].items():
+                chunks.append(f"{key} = {manifest_decision_value(name, key, value)}{eol}")
+        merged += "".join(chunks)
+    validate_manifest_decisions(merged, canonical)
+    return merged, merged != text
+
+
+def write_bytes_atomic(path: Path, payload: bytes) -> None:
+    """Replace a file in one step so a failed merge never truncates the manifest."""
+    handle, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(payload)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def update_manifest(root: Path) -> bool:
+    """Fill missing canonical decision structure; return whether the manifest changed."""
+    path = manifest_path(root)
+    try:
+        original = path.read_bytes()
+    except OSError as error:
+        fail(f"cannot read .agent-framework.toml: {error}")
+    try:
+        text = original.decode("utf-8")
+    except UnicodeDecodeError as error:
+        fail(f"cannot decode .agent-framework.toml: {error}")
+    canonical = canonical_manifest_decisions()
+    merged, changed = merge_manifest_decisions(text, canonical)
+    if not changed:
+        return False
+    backup = root / ".agent-managed" / "backups" / MANIFEST_UPDATE_BACKUP
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    if not backup.exists():
+        backup.write_bytes(original)
+    write_bytes_atomic(path, merged.encode("utf-8"))
+    parse_toml_text(path.read_text(encoding="utf-8"), ".agent-framework.toml")
+    return True
 
 
 def write_manifest(
@@ -1036,10 +1330,16 @@ def select_orchestrator_model(root: Path, data: dict, catalog: dict, requested: 
 
 def persist_orchestrator_model(root: Path, model: str) -> None:
     path = manifest_path(root)
-    text = path.read_text(encoding="utf-8")
-    updated = replace_manifest_value(text, "orchestrator_model", json.dumps(model))
-    if updated != text:
-        path.write_text(updated, encoding="utf-8")
+    original = path.read_bytes()
+    text = original.decode("utf-8")
+    # Keep the project's newline style: read_text/write_text would silently
+    # rewrite a CRLF manifest as LF.
+    eol = toml_line_ending(text.splitlines(keepends=True))
+    normalized = text.replace("\r\n", "\n")
+    updated = replace_manifest_value(normalized, "orchestrator_model", json.dumps(model))
+    payload = updated.replace("\n", eol).encode("utf-8")
+    if payload != original:
+        write_bytes_atomic(path, payload)
 
 
 def preflight_reinstall_catalog(
@@ -1741,6 +2041,14 @@ def command_init(args: argparse.Namespace) -> None:
 def command_sync(args: argparse.Namespace) -> None:
     root = Path(args.root).resolve()
     data = parse_manifest(root)
+    if getattr(args, "update_manifest", False):
+        # Runs before any managed write: a malformed or incompatible manifest
+        # aborts sync without leaving partially managed files behind.
+        manifest_changed = update_manifest(root)
+        data = parse_manifest(root)
+    else:
+        manifest_changed = False
+    print(f"MANIFEST: {'updated' if manifest_changed else 'unchanged'}")
     copy_assets(root, data["profile"])
     changed = sync_agents(root, backup=False)
     try:
@@ -2519,6 +2827,11 @@ def main() -> None:
     init.set_defaults(func=command_init)
     sync = sub.add_parser("sync")
     sync.add_argument("--replace-managed", action="store_true", help="back up and restore modified framework-owned harness adapters")
+    sync.add_argument(
+        "--update-manifest",
+        action="store_true",
+        help="additively fill missing canonical [decision]/.jev/.policy/.context keys in .agent-framework.toml",
+    )
     sync.add_argument("--memory-workspace")
     sync.add_argument("--memory-project")
     sync.add_argument("--refresh-models", action="store_true")

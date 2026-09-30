@@ -12,13 +12,27 @@ import os
 import re
 import shutil
 import subprocess
+try:
+    import tomllib
+except ImportError:  # Python 3.10 compatibility
+    tomllib = None
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import catalog
-import routing
-from model_router import ModelRouter, NoCapableModel, ROLE_BUDGETS, compress_tool_output
+try:
+    from . import catalog, routing
+    from .model_router import ModelRouter, NoCapableModel, ROLE_BUDGETS, compress_tool_output
+except ImportError:
+    import catalog
+    import routing
+    from model_router import ModelRouter, NoCapableModel, ROLE_BUDGETS, compress_tool_output
+try:
+    from .decision_shadow import DecisionConfig, observe_post, observe_pre
+    from .decision_audit import DecisionAudit
+except ImportError:
+    from decision_shadow import DecisionConfig, observe_post, observe_pre
+    from decision_audit import DecisionAudit
 
 
 RUNTIME = Path(".agent-managed/runtime")
@@ -27,6 +41,7 @@ PLANS = RUNTIME / "plans"
 RECEIPTS = RUNTIME / "dispatch-receipts.jsonl"
 CIRCUITS = RUNTIME / "circuits"
 WAITS = RUNTIME / "capacity-waits"
+DECISION_CORRELATIONS = RUNTIME / "decision-correlations.json"
 ROLE_ORDER = ("orchestrator", "developer", "reviewer", "qa")
 CLASS_ORDER = tuple(routing.MODEL_CLASS_ORDER)
 TASK_HEADER_TEMPLATE = r"^###\s+{task}:"
@@ -65,6 +80,79 @@ def read_json(path: Path, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"invalid {label}: root must be object")
     return value
+
+
+def load_project_manifest(root: Path) -> dict[str, Any]:
+    """Load the canonical project manifest for calls that lack an override."""
+    path = root / ".agent-framework.toml"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    if tomllib is not None:
+        try:
+            return tomllib.loads(text)
+        except (tomllib.TOMLDecodeError, TypeError):
+            return {}
+    # The supported runtimes normally provide tomllib; retain a bounded
+    # compatibility parser for the test/runtime Python 3.9 image.
+    result: dict[str, Any] = {}
+    table: dict[str, Any] = result
+    for line in text.splitlines():
+        stripped = line.split("#", 1)[0].strip()
+        if not stripped:
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            table = result
+            for part in stripped[1:-1].split("."):
+                table = table.setdefault(part, {})
+            continue
+        if "=" not in stripped:
+            continue
+        key, raw = (part.strip() for part in stripped.split("=", 1))
+        if raw.lower() in {"true", "false"}:
+            value: Any = raw.lower() == "true"
+        elif raw.startswith(("[", "{")):
+            try:
+                value = json.loads(raw.replace("'", '"'))
+            except json.JSONDecodeError:
+                value = raw.strip('"')
+        else:
+            try:
+                value = int(raw)
+            except ValueError:
+                value = raw.strip('"')
+        table[key] = value
+    return result
+
+
+def _decision_correlation_key(plan: dict[str, Any]) -> str:
+    return canonical_hash({"feature": plan.get("feature"), "task": plan.get("task"), "proposalId": plan.get("proposalId")})
+
+
+def _decision_task_id(task_id: str | None, target: str) -> str:
+    return task_id or f"intent-{canonical_hash(target)[:12]}"
+
+
+def _remember_decision_correlation(root: Path, plan_context: dict[str, Any], correlation_id: str) -> None:
+    values = read_json(root / DECISION_CORRELATIONS, "decision correlation lookup") if (root / DECISION_CORRELATIONS).is_file() else {}
+    values[_decision_correlation_key(plan_context)] = {"correlationId": correlation_id, "snapshot": {"feature": plan_context.get("feature"), "task": plan_context.get("task"), "proposalId": plan_context.get("proposalId")}}
+    safe_write_json(root / DECISION_CORRELATIONS, values)
+
+
+def _find_decision_correlation(root: Path, plan: dict[str, Any]) -> str | None:
+    path = root / DECISION_CORRELATIONS
+    if not path.is_file():
+        return None
+    try:
+        values = read_json(path, "decision correlation lookup")
+        entry = values.get(_decision_correlation_key(plan))
+        if isinstance(entry, dict) and entry.get("snapshot") == {"feature": plan.get("feature"), "task": plan.get("task"), "proposalId": plan.get("proposalId")}:
+            correlation = entry.get("correlationId")
+            return correlation if isinstance(correlation, str) else None
+    except ValueError:
+        return None
+    return None
 
 
 def manifest_provider_policy(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -486,6 +574,22 @@ def create_proposal(
         }
     if route.get("classification", {}).get("confidence") == "LOW":
         raise ValueError("CLASSIFICATION_REQUIRED: deterministic inference confidence is low; declare task Complexity and Risk")
+    # Invalid enabled decision configuration is a proposal error, not a
+    # best-effort runtime/audit failure.
+    decision_config = DecisionConfig.from_manifest(manifest)
+    decision_pre: dict[str, Any] | None = None
+    if decision_config.enabled:
+        decision_pre = observe_pre(
+            decision_config,
+            {
+                "id": _decision_task_id(task_id, target),
+                "feature": feature or "decision-plane",
+                "objective": capsule["objective"],
+                "requirements": capsule["acceptanceCriteria"],
+            },
+            route, {**(current if tasks_path else {}), "executionPolicy": execution, "history": (current.get("history", []) if isinstance(current, dict) else [])}, capsule,
+            audit=DecisionAudit(root, decision_config.audit_path),
+        )
     mapping = load_mapping(root, harness)
     available_ids = {value["id"] for value in catalog_models(lock, harness, scope)}
     configured_orchestrator = manifest.get("orchestrator_model")
@@ -548,6 +652,12 @@ def create_proposal(
         "roles": roles,
         "status": "PROPOSED",
     }
+    try:
+        correlation = decision_pre.get("correlation_id") if isinstance(decision_pre, dict) else None
+        if isinstance(correlation, str):
+            _remember_decision_correlation(root, proposal, correlation)
+    except Exception:
+        pass
     safe_write_json(root / PROPOSALS / f"{proposal_id}.json", proposal)
     return proposal
 
@@ -923,8 +1033,11 @@ def record_receipt(
     cache_tokens: int | None,
     gates: list[str],
     effective_harness: str | None = None,
+    manifest: dict[str, Any] | None = None,
+    correlation_id: str | None = None,
 ) -> dict[str, Any]:
     plan = load_plan(root, plan_id, allow_state_change=True)
+    manifest = manifest if manifest is not None else load_project_manifest(root)
     contract = next((value for value in plan["roles"] if value["role"] == role), None)
     if contract is None:
         raise ValueError(f"role {role!r} is not approved by plan {plan_id}")
@@ -1003,6 +1116,25 @@ def record_receipt(
         metric_path.parent.mkdir(parents=True, exist_ok=True)
         with metric_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(metric, ensure_ascii=False, separators=(",", ":")) + "\n")
+    try:
+        config = DecisionConfig.from_manifest(manifest)
+        if config.enabled:
+            correlation_id = correlation_id or _find_decision_correlation(root, plan)
+            decision_task_id = _decision_task_id(plan.get("task"), str(plan.get("target") or ""))
+            observe_post(
+                config,
+                {"eventualResult": result, "comparison": {}, "usage": {
+                    "inputTokens": input_tokens, "outputTokens": output_tokens,
+                    "cacheTokens": cache_tokens, "costMicrounits": cost_microunits,
+                }, "model": effective_model, "role": role, "gates": gates,
+                 "feature": feature or "decision-plane", "task": decision_task_id,
+                 "taskId": decision_task_id, "taskContext": contract.get("contextCapsule", {}),
+                 "authoritativePreDecision": {"planId": plan_id, "proposalId": plan.get("proposalId"),
+                                               "model": contract.get("model"), "provider": contract.get("provider")}},
+                root=root, correlation_id=correlation_id,
+            )
+    except Exception:
+        pass
     return compact
 
 

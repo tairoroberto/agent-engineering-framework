@@ -1,0 +1,23 @@
+[decision]
+enabled = true
+mode = "shadow"
+providers = ["mock", "deterministic-safe"]
+audit_path = "tmp/decision-audit.jsonl"
+
+[decision.jev]
+endpoint = "https://api.typesafe.ai/v1/systemone"
+model = "jev-latest"
+timeout = 10.0
+
+[decision.policy]
+minimum_confidence = 0.8
+reasoning_probability = 0.75
+review_probability = 0.65
+qa_probability = 0.6
+escalation_probability = 0.9
+
+[decision.context]
+max_questions = 12
+max_metadata_facts = 16
+max_text_chars = 1000
+max_bytes = 8192

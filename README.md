@@ -8,6 +8,43 @@ Local-first, language-neutral engineering behavior for AI agents. It keeps one v
 
 Framework owns how agents cooperate. A project owns architecture, commands, release policy, domain rules, and AGENTS.md outside managed block.
 
+## Decision Plane (disabled by default)
+
+The optional Decision Plane observes existing workflow without becoming workflow
+authority. It stays disabled unless operators manually opt in. Its three-plane
+boundary is:
+
+```text
+Deterministic Plane          Decision Plane                  Generative Plane
+state + routing + gates  ->  Decision Engine -> Profile     -> proposal/approval
+convergence authority        -> Policy -> Execution Tier    -> Model Router
+                              -> fallback/confidence/audit  -> harness execution
+```
+
+The Decision Engine receives only bounded authoritative facts, normalizes them
+into a task profile, and evaluates pure policy. Execution tiers map to the
+existing model classes; the Model Router still selects the concrete model.
+Provider attempts are ordered and one-shot: official Jev opt-in first, then
+deterministic-safe fallback. `TYPESAFE_API_KEY` is environment-only. Unknown or
+low-confidence evidence is recorded and can recommend
+escalation, but cannot weaken deterministic floors. Fact-only audit records
+capture confidence, fallback, recommendation, and comparison data without
+prompts, payloads, transcripts, reasoning, credentials, or full diffs.
+
+Configuration is opt-in and safe by construction: absent or `enabled = false`
+means no decision context, provider, or audit work. The only accepted modes are
+`disabled` and `shadow`; shadow mode may write runtime observations, but never
+changes tasks, gates, convergence, roles, proposal identity, approval,
+fallback order, model selection, harness commands, or dispatch. Decision output
+has no influence on workflow. See the [Decision Plane design](.specs/features/decision-plane-foundation/design.md),
+[specification](.specs/features/decision-plane-foundation/spec.md), and
+[operator contract](docs/model-routing-and-installation.md) for details.
+
+The official HTTP Jev adapter is available only through explicit operator
+opt-in. It is disabled by default and runs shadow-only, non-authoritatively; see
+the [operator contract](docs/model-routing-and-installation.md). Explicit
+configuration uses the official adapter rather than an `UNSUPPORTED` placeholder.
+
 ## Install
 
 ```bash
@@ -20,6 +57,28 @@ Framework owns how agents cooperate. A project owns architecture, commands, rele
 ```
 
 `init` creates `.agent-framework.toml`, copies lazy-load assets to `.agent-managed/agent-engineering-framework/`, backs up AGENTS.md once, and adds only its marker block. When ai-memory is enabled it creates `.ai-memory.toml` only when absent; that file becomes project-owned immediately and is thereafter preserved byte for byte. `sync` uses the same idempotent bootstrap.
+
+For consumers, run `agent-kit sync` to update managed runtime, adapters, and
+documentation; it does not change project-owned configuration. Managed asset
+sync never enables Jev: manifest opt-in and `TYPESAFE_API_KEY` remain manual.
+Follow the [consumer sync procedure](docs/command-workflow-migration.md).
+
+`agent-kit sync --update-manifest` is the one opt-in sync exception: it additively
+fills missing canonical `[decision]`, `[decision.jev]`, `[decision.policy]`, and
+`[decision.context]` keys or tables in `.agent-framework.toml` from the shipped
+template. Plain `sync` never edits the manifest. The flag preserves every existing
+value, comment, key order, unrelated section, and the file's newline style, and it
+never flips `enabled` to true or writes a credential: a missing `enabled` is always
+materialized as `false`. It is section-aware, so duplicate `[decision*]` headers,
+duplicate keys, non-canonical keys inside a managed section, and value-type
+mismatches are rejected before any managed write. On change it writes a one-time
+exact backup to
+`.agent-managed/backups/agent-framework.toml.before-update-manifest`, writes the
+manifest atomically, reparses the result, and prints `MANIFEST: updated` or
+`MANIFEST: unchanged` before continuing the normal sync. Repeat runs are
+byte-identical no-ops. Enabling Jev afterwards remains manual: set
+`[decision] enabled = true`, keep `providers` including `"jev"`, and export
+`TYPESAFE_API_KEY` yourself.
 
 In an interactive `init`, the CLI also offers `Adicionar agent-kit ao PATH ...? [y/N]` when its managed entry is absent. Zsh targets `~/.zshrc` and Bash targets `~/.bash_profile`. The default is no, the entry is idempotent, and non-interactive initialization never changes the shell profile, including with `--yes`.
 

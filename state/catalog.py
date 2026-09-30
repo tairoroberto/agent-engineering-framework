@@ -13,7 +13,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from model_router import ModelDescriptor
+try:
+    from .model_router import ModelDescriptor
+except ImportError:
+    from model_router import ModelDescriptor
 
 
 LOCK_PATH = Path(".agent-managed/model-catalog.lock.json")

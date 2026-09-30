@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import pty
+import re
 import shutil
 import subprocess
 import tempfile
 import unittest
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 
@@ -14,9 +17,97 @@ FRAMEWORK = Path(__file__).resolve().parents[1]
 CLI = FRAMEWORK / "bin" / "agent-kit"
 STATE = FRAMEWORK / "state" / "state.py"
 ROUTING = FRAMEWORK / "state" / "routing.py"
+agent_kit = SourceFileLoader("agent_kit", str(CLI)).load_module()
+validate_framework = SourceFileLoader(
+    "validate_framework", str(FRAMEWORK / "scripts" / "validate_framework.py")
+).load_module()
 
 
 class AgentKitTest(unittest.TestCase):
+    def test_framework_validator_requires_exact_jev_section(self) -> None:
+        template = (FRAMEWORK / "templates" / "agent-framework.toml").read_text(encoding="utf-8")
+        self.assertEqual([], validate_framework.validate_jev_template(template))
+        for mutation in (
+            template.replace("timeout = 10.0", "timeout = 10.0\nunknown = true"),
+            template.replace(
+                '[decision.jev]\nendpoint = "https://api.typesafe.ai/v1/systemone"',
+                '[decision.jev]',
+            ).replace(
+                "[decision.policy]\n",
+                '[decision.policy]\nendpoint = "https://api.typesafe.ai/v1/systemone"\n',
+            ),
+            template.replace("model = \"jev-latest\"", "model = \"wrong\""),
+        ):
+            self.assertTrue(validate_framework.validate_jev_template(mutation))
+
+    def test_init_and_sync_are_network_free_without_typesafe_key(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            root = base / "consumer"
+            root.mkdir()
+            guard = base / "network-guard"
+            guard.mkdir()
+            (guard / "sitecustomize.py").write_text(
+                "import socket\n"
+                "def blocked(*args, **kwargs): raise AssertionError('network access')\n"
+                "socket.getaddrinfo = blocked\n"
+                "socket.create_connection = blocked\n"
+                "socket.socket.connect = blocked\n"
+                "import urllib.request\n"
+                "urllib.request.urlopen = blocked\n"
+                "urllib.request.build_opener = blocked\n"
+                "urllib.request.OpenerDirector.open = blocked\n",
+                encoding="utf-8",
+            )
+            sentinel = guard / "loaded"
+            (guard / "sitecustomize.py").write_text(
+                (guard / "sitecustomize.py").read_text(encoding="utf-8")
+                + f"\nfrom pathlib import Path\nPath({str(sentinel)!r}).open('a').write('loaded\\n')\n",
+                encoding="utf-8",
+            )
+            env = self.sanitized_env(str(guard))
+            env["PYTHONPATH"] = str(guard)
+            self.run_cli(root, "init", "--profile", "generic", env=env)
+            self.run_cli(root, "sync", env=env)
+            self.run_cli(root, "sync", env=env)
+            self.assertEqual(3, sentinel.read_text(encoding="utf-8").count("loaded"))
+
+    def test_fallback_toml_parser_handles_decision_defaults_and_rejects_special_floats(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "config.toml"
+            path.write_text(
+                "[decision.policy]\nminimum_confidence = +0.8\nretry_ceiling = -2\n"
+                "[decision.context]\nmax_bytes = 8192\nratio = .5\n"
+                "positive_exponent = 1.25e+2\nsigned_decimal = -1.5E-1\n",
+                encoding="utf-8",
+            )
+            parsed = agent_kit.load_flat_toml(path)
+            self.assertEqual(0.8, parsed["decision"]["policy"]["minimum_confidence"])
+            self.assertEqual(-2, parsed["decision"]["policy"]["retry_ceiling"])
+            self.assertEqual(8192, parsed["decision"]["context"]["max_bytes"])
+            self.assertEqual(0.5, parsed["decision"]["context"]["ratio"])
+            self.assertEqual(125.0, parsed["decision"]["context"]["positive_exponent"])
+            self.assertEqual(-0.15, parsed["decision"]["context"]["signed_decimal"])
+            for invalid in ("nan", "inf", "1e9999", "-1e9999"):
+                path.write_text(f"value = {invalid}\n", encoding="utf-8")
+                with self.assertRaises(SystemExit):
+                    agent_kit.load_flat_toml(path)
+
+    def test_fallback_parser_supports_full_decision_template_init(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "consumer"
+            root.mkdir()
+            original = agent_kit.tomllib
+            agent_kit.tomllib = None
+            try:
+                result = self.run_cli(root, "init", "--profile", "generic", "--harness", "opencode")
+                self.assertIn("INIT:", result.stdout)
+                parsed = agent_kit.load_flat_toml(root / ".agent-framework.toml")
+                self.assertEqual(0.7, parsed["decision"]["policy"]["minimum_confidence"])
+                self.assertEqual(16384, parsed["decision"]["context"]["max_bytes"])
+            finally:
+                agent_kit.tomllib = original
+
     def test_init_offers_idempotent_shell_path_for_zsh_and_bash(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             base = Path(raw)
@@ -422,6 +513,288 @@ class AgentKitTest(unittest.TestCase):
             self.run_cli(root, "sync")
             self.run_cli(root, "sync")
             self.assertEqual(old.read_bytes(), generated)
+
+    def test_sync_delivers_jev_runtime_and_docs_without_touching_manifest_or_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "consumer"
+            root.mkdir()
+            self.run_cli(root, "init", "--profile", "generic")
+            manifest = root / ".agent-framework.toml"
+            manifest.write_bytes(manifest.read_bytes() + b"\n# project-owned\n")
+            before_manifest = manifest.read_bytes()
+            managed = root / ".agent-managed/agent-engineering-framework"
+
+            guard = Path(raw) / "network-guard"
+            guard.mkdir()
+            (guard / "sitecustomize.py").write_text(
+                "import socket\n"
+                "def blocked(*args, **kwargs): raise AssertionError('network access')\n"
+                "socket.getaddrinfo = blocked\n"
+                "socket.create_connection = blocked\n"
+                "socket.socket.connect = blocked\n"
+                "import urllib.request\n"
+                "urllib.request.urlopen = blocked\n"
+                "urllib.request.build_opener = blocked\n"
+                "urllib.request.OpenerDirector.open = blocked\n",
+                encoding="utf-8",
+            )
+            sentinel = guard / "loaded"
+            (guard / "sitecustomize.py").write_text(
+                (guard / "sitecustomize.py").read_text(encoding="utf-8")
+                + f"\nfrom pathlib import Path\nPath({str(sentinel)!r}).open('a').write('loaded\\n')\n",
+                encoding="utf-8",
+            )
+            env = self.sanitized_env(str(guard))
+            self.run_cli(root, "sync", env=env)
+            first = {path.relative_to(managed): path.read_bytes() for path in managed.rglob("*") if path.is_file()}
+            self.assertIn("JevDecisionProvider", (managed / "state/decision_jev.py").read_text(encoding="utf-8"))
+            consumer_docs = managed / "docs/model-routing-and-installation.md"
+            self.assertTrue(consumer_docs.is_file())
+            self.assertIn("agent-kit sync", consumer_docs.read_text(encoding="utf-8"))
+            self.assertEqual(before_manifest, manifest.read_bytes())
+            self.assertNotIn(b"TYPESAFE_API_KEY =", b"".join(first.values()))
+            self.assertFalse(any(b"Authorization: Bearer" in content for content in first.values()))
+            self.assertGreaterEqual(sentinel.read_text(encoding="utf-8").count("loaded"), 1)
+
+            self.run_cli(root, "sync", env=env)
+            second = {path.relative_to(managed): path.read_bytes() for path in managed.rglob("*") if path.is_file()}
+            self.assertEqual(first, second)
+            self.assertEqual(before_manifest, manifest.read_bytes())
+
+    # --- sync --update-manifest -------------------------------------------------
+
+    MINIMAL_MANIFEST = (
+        'framework_version = "1"\n'
+        'profile = "generic"\n'
+        'harnesses = ["opencode"]\n'
+    )
+
+    def decision_manifest(self, root: Path, body: str) -> Path:
+        """Write a project manifest with a deliberately incomplete decision plane."""
+        manifest = root / ".agent-framework.toml"
+        manifest.write_text(self.MINIMAL_MANIFEST + body, encoding="utf-8")
+        return manifest
+
+    def test_update_manifest_fills_missing_decision_tables_and_preserves_project_content(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "consumer"
+            root.mkdir()
+            manifest = self.decision_manifest(
+                root,
+                "\n# project-owned routing note\n"
+                "[decision]\n"
+                "enabled = false\n"
+                'mode = "shadow"\n'
+                'providers = ["jev", "deterministic-safe"] # keep Jev for later\n'
+                "\n[decision.policy]\n"
+                "minimum_confidence = 0.95\n",
+            )
+
+            result = self.run_cli(root, "sync", "--update-manifest")
+
+            self.assertIn("MANIFEST: updated", result.stdout)
+            self.assertIn("SYNC:", result.stdout)
+            text = manifest.read_text(encoding="utf-8")
+            self.assertIn("# project-owned routing note", text)
+            self.assertIn('providers = ["jev", "deterministic-safe"] # keep Jev for later', text)
+            self.assertIn("minimum_confidence = 0.95", text)
+            self.assertIn("[decision.jev]", text)
+            self.assertIn("[decision.context]", text)
+            self.assertIn("audit_path = ", text)
+            self.assertIn("max_bytes = 16384", text)
+            self.assertIn('endpoint = "https://api.typesafe.ai/v1/systemone"', text)
+            data = agent_kit.parse_toml_text(text, ".agent-framework.toml")
+            self.assertEqual(0.95, data["decision"]["policy"]["minimum_confidence"])
+            self.assertEqual(10.0, data["decision"]["jev"]["timeout"])
+            self.assertLess(
+                text.index("[decision]"), text.index("[decision.jev]"),
+                "existing sections keep their relative order",
+            )
+            self.assertIn("[decision.jev]", text)
+
+    def test_update_manifest_never_enables_decision_or_adds_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "consumer"
+            root.mkdir()
+            manifest = self.decision_manifest(root, "\n[decision]\nmode = \"shadow\"\n")
+
+            self.run_cli(root, "sync", "--update-manifest")
+
+            text = manifest.read_text(encoding="utf-8")
+            data = agent_kit.parse_toml_text(text, ".agent-framework.toml")
+            self.assertIs(False, data["decision"]["enabled"])
+            self.assertEqual(["deterministic-safe"], data["decision"]["providers"])
+            for forbidden in ("api_key", "apikey", "token", "secret", "password", "Bearer"):
+                self.assertNotIn(forbidden, text)
+            self.assertNotIn("TYPESAFE_API_KEY", text)
+            self.assertFalse((root / ".env").exists())
+
+    def test_update_manifest_is_byte_idempotent_and_backs_up_exactly_once(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "consumer"
+            root.mkdir()
+            manifest = self.decision_manifest(root, "")
+            original = manifest.read_bytes()
+
+            self.assertIn("MANIFEST: updated", self.run_cli(root, "sync", "--update-manifest").stdout)
+            merged = manifest.read_bytes()
+            backup = root / ".agent-managed/backups/agent-framework.toml.before-update-manifest"
+            self.assertEqual(original, backup.read_bytes())
+
+            self.assertIn("MANIFEST: unchanged", self.run_cli(root, "sync", "--update-manifest").stdout)
+            self.assertEqual(merged, manifest.read_bytes())
+            self.assertEqual(original, backup.read_bytes(), "backup is written once and never rewritten")
+
+    def test_update_manifest_preserves_custom_values_comments_order_and_crlf(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "consumer"
+            root.mkdir()
+            manifest = root / ".agent-framework.toml"
+            body = (
+                "\r\n# leading project comment\r\n"
+                "[decision]\r\n"
+                "enabled = true\r\n"
+                'mode = "observe"\r\n'
+                "\r\n# policy is owned by this project\r\n"
+                "[decision.policy]\r\n"
+                "minimum_confidence = 0.42\r\n"
+                "\r\n# unrelated content stays put\r\n"
+                "[project.rules]\r\n"
+                'owner = "platform"\r\n'
+            )
+            manifest.write_bytes(
+                self.MINIMAL_MANIFEST.replace("\n", "\r\n").encode("utf-8") + body.encode("utf-8")
+            )
+
+            self.assertTrue(agent_kit.update_manifest(root))
+            self.assertFalse(agent_kit.update_manifest(root), "second run is a no-op")
+
+            raw_text = manifest.read_bytes().decode("utf-8")
+            self.assertEqual(0, len(re.findall(r"(?<!\r)\n", raw_text)), "every newline stays CRLF")
+            self.assertNotIn("\r\r", raw_text)
+            self.assertEqual(raw_text.count("\r\n"), raw_text.count("\n"))
+            self.assertIn("# leading project comment\r\n", raw_text)
+            self.assertIn("# policy is owned by this project\r\n", raw_text)
+            self.assertIn("# unrelated content stays put\r\n", raw_text)
+            self.assertIn("enabled = true\r\n", raw_text, "an explicitly enabled project stays enabled")
+            self.assertIn("minimum_confidence = 0.42\r\n", raw_text)
+            self.assertIn('owner = "platform"', raw_text)
+            self.assertLess(raw_text.index("[decision]"), raw_text.index("[decision.policy]"))
+            self.assertLess(raw_text.index("[decision.policy]"), raw_text.index("[project.rules]"))
+            data = agent_kit.parse_toml_text(raw_text, ".agent-framework.toml")
+            self.assertIs(True, data["decision"]["enabled"])
+            self.assertEqual("platform", data["project"]["rules"]["owner"])
+
+    def test_update_manifest_rejects_malformed_and_incompatible_targets_before_managed_writes(self) -> None:
+        cases = {
+            "duplicate section": "\n[decision]\nenabled = false\n[decision]\n",
+            "duplicate key": "\n[decision]\nenabled = false\nenabled = true\n",
+            "incompatible value type": "\n[decision]\nenabled = \"yes\"\n",
+            "non-canonical key": "\n[decision.policy]\nminimum_confidence = 0.7\nfoo = 1\n",
+            "value instead of table": '\ndecision = "on"\n',
+            "malformed toml": "\n[decision\n",
+        }
+        for label, body in cases.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw) / "consumer"
+                root.mkdir()
+                manifest = self.decision_manifest(root, body)
+                before = manifest.read_bytes()
+
+                result = self.run_cli(root, "sync", "--update-manifest", check=False)
+
+                self.assertNotEqual(0, result.returncode, label)
+                self.assertNotIn("SYNC:", result.stdout, label)
+                self.assertEqual(before, manifest.read_bytes(), label)
+                self.assertFalse(
+                    (root / ".agent-managed/agent-engineering-framework").exists(), label
+                )
+                self.assertFalse(
+                    (root / ".agent-managed/backups/agent-framework.toml.before-update-manifest").exists(),
+                    label,
+                )
+
+    def test_plain_sync_leaves_manifest_untouched_and_reports_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "consumer"
+            root.mkdir()
+            manifest = self.decision_manifest(root, '\n[provider]\nallowed = ["opencode"]\n')
+            # Settle the manifest first: sync may pin orchestrator_model once.
+            self.run_cli(root, "sync")
+            before = manifest.read_bytes()
+            self.assertNotIn("[decision]", before.decode("utf-8"))
+
+            first = self.run_cli(root, "sync")
+            self.assertIn("MANIFEST: unchanged", first.stdout)
+            self.assertIn("SYNC:", first.stdout)
+            self.assertEqual(before, manifest.read_bytes())
+            self.assertFalse(
+                (root / ".agent-managed/backups/agent-framework.toml.before-update-manifest").exists(),
+                "a plain sync must not create an update-manifest backup",
+            )
+
+            # The flag, not the sync itself, is what fills the manifest.
+            self.assertIn("MANIFEST: updated", self.run_cli(root, "sync", "--update-manifest").stdout)
+            self.assertIn("[decision.jev]", manifest.read_text(encoding="utf-8"))
+            self.assertIn("MANIFEST: unchanged", self.run_cli(root, "sync").stdout)
+
+    def test_update_manifest_does_not_read_network_or_credential_environment(self) -> None:
+        # The merge path itself must stay free of network and credential reads.
+        for name in (
+            "update_manifest", "merge_manifest_decisions", "canonical_manifest_decisions",
+            "check_manifest_decision_structure", "validate_manifest_decisions",
+            "parse_toml_text", "write_bytes_atomic",
+        ):
+            source = inspect.getsource(getattr(agent_kit, name))
+            self.assertNotIn("environ", source, name)
+            self.assertNotIn("urllib", source, name)
+            self.assertNotIn("socket", source, name)
+            self.assertNotIn("TYPESAFE", source, name)
+
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            root = base / "consumer"
+            root.mkdir()
+            self.decision_manifest(root, "\n[decision]\nenabled = false\n")
+            guard = base / "network-guard"
+            guard.mkdir()
+            (guard / "sitecustomize.py").write_text(
+                "import socket\n"
+                "def blocked(*args, **kwargs): raise AssertionError('network access')\n"
+                "socket.getaddrinfo = blocked\n"
+                "socket.create_connection = blocked\n"
+                "socket.socket.connect = blocked\n"
+                "import urllib.request\n"
+                "urllib.request.urlopen = blocked\n"
+                "urllib.request.build_opener = blocked\n"
+                "urllib.request.OpenerDirector.open = blocked\n",
+                encoding="utf-8",
+            )
+            sentinel = "jev-secret-sentinel"
+            env = {**self.sanitized_env(str(guard)), "TYPESAFE_API_KEY": sentinel}
+
+            result = self.run_cli(root, "sync", "--update-manifest", env=env)
+
+            self.assertIn("MANIFEST: updated", result.stdout)
+            data = agent_kit.parse_toml_text(
+                (root / ".agent-framework.toml").read_text(encoding="utf-8"), "manifest"
+            )
+            self.assertEqual(10.0, data["decision"]["jev"]["timeout"])
+            self.assertNotIn(
+                sentinel,
+                b"".join(path.read_bytes() for path in root.rglob("*") if path.is_file() and "__pycache__" not in path.parts).decode("utf-8", "replace"),
+                "the merge never copies a credential into project files",
+            )
+
+    def sanitized_env(self, pythonpath: str) -> dict[str, str]:
+        env: dict[str, str] = {}
+        for key in os.environ:
+            if key == "TYPESAFE_API_KEY":
+                continue
+            env[key] = os.environ[key]
+        env["PYTHONPATH"] = pythonpath
+        self.assertNotIn("TYPESAFE_API_KEY", env)
+        return env
 
     def test_portable_state_survives_harness_change_and_rejects_session_data(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

@@ -73,7 +73,7 @@ DIRECT_EXECUTION_GUIDANCE = (
     "continue approved ready tasks without routine continuation questions. "
     "Complete related edits, then run only impact-selected or explicitly required checks. "
     "Format changed supported files once when applicable; reuse valid evidence and rerun only checks invalidated by concrete fixes. "
-    "Stop after acceptance passes. Preserve role boundaries and approved dispatch contracts."
+    "Stop after acceptance passes. Recover empty routing classes through the cheapest capable catalog model in the same role family/provider; sync missing adapters once. Preserve role boundaries and approved dispatch contracts."
 )
 
 
@@ -197,7 +197,7 @@ def opencode_agent(role: str, mode: str, model: str, read_only: bool = False, *,
     # in each agent so normalization cannot silently widen workspace access.
     permissions += "\n  external_directory: ask"
     instructions = {
-        "orchestrator": "Own decomposition, dependencies, canonical state/evidence reconciliation, review loop, QA, and final integration. Delegate all production work; never edit production code. Every dispatch includes owned paths or a diff boundary. For formal tasks, honor the workflow provider selector. Resolve production with `resolve <tasks.md> <task> opencode --provider <name>`; resolve Reviewer/QA with `resolve-class opencode <reviewClasses|qaClasses> <class> --provider <name>`. Every returned JSON is a hard dispatch contract: call only `exec.agent`, include `PROVIDER: exec.provider` in the Task payload, and stop if its provider differs from the requested provider. The provider constraint applies to Developer, Reviewer, and QA. A global gate failure only outside that boundary is `EXTERNAL_DIRTY_WORKTREE`: it blocks clean-worktree release evidence, not the evaluated task; never ask QA to edit/revert it. A quota/rate-limit/unavailable error is terminal for that child: do not ask it to retry or wait indefinitely. Immediately resolve again with `--exclude-model <failed-model>` and dispatch only the next candidate, retaining a named provider; `auto` may change provider. If the active harness cannot cancel an already pending child, mark it cancelled/blocked in canonical state, dispatch no dependent work, and report the required UI cancellation. No candidate is a blocker. Resolve project gates from profile and project rules.",
+        "orchestrator": "Own decomposition, dependencies, canonical state/evidence reconciliation, review loop, QA, and final integration. Delegate all production work; never edit production code. Every dispatch includes owned paths or a diff boundary. For formal tasks, honor the workflow provider selector. Resolve production with `resolve <tasks.md> <task> opencode --provider <name>`; resolve Reviewer/QA with `resolve-class opencode <reviewClasses|qaClasses> <class> --provider <name>`. Every returned JSON is a hard dispatch contract: call only `exec.agent`, include `PROVIDER: exec.provider` in the Task payload, and stop if its provider differs from the requested provider. The provider constraint applies to Developer, Reviewer, and QA. A global gate failure only outside that boundary is `EXTERNAL_DIRTY_WORKTREE`: it blocks clean-worktree release evidence, not the evaluated task; never ask QA to edit/revert it. A quota/rate-limit/unavailable error is terminal for that child: do not ask it to retry or wait indefinitely. Immediately resolve again with `--exclude-model <failed-model>` and dispatch only the next candidate, retaining a named provider; `auto` may change provider. If the active harness cannot cancel an already pending child, mark it cancelled/blocked in canonical state, dispatch no dependent work, and report the required UI cancellation. An empty class triggers automatic cheapest-capable catalog recovery in the same role family. Run `agent-kit sync` once to regenerate missing adapters; refresh a stale catalog once with `agent-kit sync --refresh-models`. Retain the provider, task capability floor and failed-model exclusions; escalate only if no eligible executable candidate remains. Resolve project gates from profile and project rules.",
         "planner": "Write only scoped specification, design, and task artifacts when required. Never edit canonical state/validation evidence, implement production code, or redefine project architecture.",
         "developer-low": "Implement one bounded low-complexity task. Add tests only for changed behavior that needs coverage. Run discovered development gates only when relevant to the changed scope or explicitly required; no automatic format/analyze/test sequence. Return compact gate evidence and Developer Closure facts to the Orchestrator; never write planning/state artifacts.",
         "developer": "Implement one bounded task. Add tests only for changed behavior that needs coverage. Run discovered development gates only when relevant to the changed scope or explicitly required; no automatic format/analyze/test sequence. Return compact gate evidence and Developer Closure facts to the Orchestrator; never write planning/state artifacts.",
@@ -376,6 +376,13 @@ def opencode_extra_candidates(
             for class_name in classes
             if (family, class_name) in OPENCODE_EXTRA_AGENT_ROLES
         ]
+        # A stronger model can serve a cheaper task. Fill every supported lower
+        # floor so a provider with no economy-labelled model remains usable.
+        rank = max((OPENCODE_CLASS_RANK.index(value) for value in classes if value in OPENCODE_CLASS_RANK), default=-1)
+        for class_name in OPENCODE_CLASS_RANK[:rank + 1]:
+            target = ("modelClasses", class_name)
+            if target not in targets:
+                targets.append(target)
         # Every discovered model is also a review/QA candidate: capability
         # floors (not candidacy) decide eligibility, so reviewer and QA
         # planes always have a provider-local pool to filter.

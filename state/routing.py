@@ -526,13 +526,73 @@ def approved_models(harness: str) -> set[str]:
     return models
 
 
+def recovery_candidates(mapping: dict[str, Any], harness: str, family: str, class_name: str, *, provider: str = "auto", excluded_models: set[str] | None = None) -> list[dict[str, Any]]:
+    """Recover from the catalog and existing same-role adapters, cheapest first.
+
+    Never invent models/agents, cross a named provider or lower the task floor.
+    Resolution is derived in memory; sync materializes complete adapter maps.
+    """
+    try:
+        from . import catalog
+        from .model_router import ModelRouter, NoCapableModel
+    except ImportError:
+        import catalog
+        from model_router import ModelRouter, NoCapableModel
+    floors = {
+        "modelClasses": {name: rank for rank, name in enumerate(MODEL_CLASS_ORDER)},
+        "reviewClasses": {"independent-reviewer": 1, "specialist-review": 2},
+        "qaClasses": {"qa-basic": 0, "qa-targeted": 1, "qa-adversarial": 2},
+    }
+    floor = floors.get(family, {}).get(class_name)
+    if floor is None:
+        return []
+    try:
+        lock = catalog.load_catalog(consumer_root())
+    except ValueError:
+        return []
+    entries = lock.get("harnesses", {}).get(harness, {}).get("models", [])
+    catalog_by_id = {item["id"]: item for item in entries if isinstance(item, dict) and isinstance(item.get("id"), str)}
+    routes = {}
+    for entry in mapping.get(family, {}).values():
+        if not isinstance(entry, dict):
+            continue
+        options = entry.get("candidates") if isinstance(entry.get("candidates"), list) else [entry]
+        for option in options:
+            if not isinstance(option, dict) or not option.get("agent") or not isinstance(option.get("model"), str):
+                continue
+            if harness == "opencode" and not (consumer_root() / ".opencode" / "agents" / f"{option['agent']}.md").is_file():
+                continue
+            item = catalog_by_id.get(option["model"])
+            if item is None or item.get("available") is not True or option["model"] in (excluded_models or set()):
+                continue
+            actual_provider = item.get("provider")
+            if option.get("provider") != actual_provider or (provider != "auto" and actual_provider != provider):
+                continue
+            rank = max((MODEL_CLASS_ORDER.index(value) for value in item.get("classes", []) if value in MODEL_CLASS_ORDER), default=-1)
+            if rank < floor:
+                continue
+            routes.setdefault(option["model"], dict(option))
+    role = {"modelClasses": "developer", "reviewClasses": "reviewer", "qaClasses": "qa"}[family]
+    descriptors = [catalog.descriptor_from_entry(catalog_by_id[model]) for model in routes]
+    try:
+        decision = ModelRouter(descriptors).route(role, provider)
+    except NoCapableModel:
+        return []
+    def cost(model):
+        price = model.expected_cost(decision.estimated_input_tokens, decision.estimated_output_tokens)
+        return (0, price, model.model_id) if price is not None else (1, model.estimated_tier_cost, model.model_id)
+    return [{**routes[model.model_id], "selectionBasis": "catalog-recovery"} for model in sorted(decision.eligible, key=cost)]
+
+
 def mapped_models(harness: str, model_class: str) -> set[str]:
     entry = load_harness_mapping(harness).get("modelClasses", {}).get(model_class, {})
     if not isinstance(entry, dict):
         return set()
     candidates = entry.get("candidates")
     options = candidates if isinstance(candidates, list) else [entry]
-    return {option["model"] for option in options if isinstance(option, dict) and isinstance(option.get("model"), str)}
+    models = {option["model"] for option in options if isinstance(option, dict) and isinstance(option.get("model"), str)}
+    models.update(option["model"] for option in recovery_candidates(load_harness_mapping(harness), harness, "modelClasses", model_class))
+    return models
 
 
 def mapped_model(harness: str, model_class: str) -> str | None:
@@ -547,8 +607,8 @@ def resolve_route(
     """Resolve a portable model class using the consumer's harness mapping.
 
     Policy intentionally selects only a capability class.  Model identifiers and
-    native agent names stay in the consumer-owned harness adapter, so an
-    unavailable model is a visible configuration error instead of a fallback.
+    native agent names stay in the consumer-owned harness adapter. Missing
+    classes recover from capable catalog models with existing role adapters.
     """
     model_class = route.get("exec", {}).get("modelClass")
     if not isinstance(model_class, str):
@@ -578,7 +638,7 @@ def resolve_mapping_class(
         raise ValueError(f"unsupported mapping family: {family}")
     entry = mapping.get(family, {}).get(class_name)
     if not isinstance(entry, dict):
-        raise ValueError(f"{harness} mapping has no route for {family}.{class_name}")
+        entry = {"candidates": []}
     if provider not in PROVIDERS:
         raise ValueError(f"unsupported provider: {provider}")
     candidates = entry.get("candidates")
@@ -600,6 +660,12 @@ def resolve_mapping_class(
         key=lambda pair: candidate_rank(pair[1], history, pair[0]),
     )
     selected = next((option for _index, option in ranked if option.get("model") not in excluded_models), None)
+    recovered = False
+    if selected is None:
+        recovery = recovery_candidates(mapping, harness, family, class_name, provider=provider, excluded_models=excluded_models)
+        if recovery:
+            selected = recovery[0]
+            recovered = True
     if selected is None:
         detail = f" provider={provider}" if provider != "auto" else ""
         raise ValueError(f"{harness} has no available configured candidate for {family}.{class_name}{detail}")
@@ -613,8 +679,8 @@ def resolve_mapping_class(
             resolved[field] = value
     resolved.setdefault("reasoningEffort", default_reasoning_effort(family, class_name))
     model_stats = history.get(str(selected.get("model")))
-    resolved["selectionBasis"] = "verified-metrics" if model_stats and model_stats["attempts"] >= 3 else "configured-order"
-    return resolved, bool(excluded_models) and bool(provider_options) and selected is not provider_options[0]
+    resolved["selectionBasis"] = "catalog-recovery" if recovered else "verified-metrics" if model_stats and model_stats["attempts"] >= 3 else "configured-order"
+    return resolved, recovered or (bool(excluded_models) and bool(provider_options) and selected is not provider_options[0])
 
 
 def default_reasoning_effort(family: str, class_name: str) -> str:

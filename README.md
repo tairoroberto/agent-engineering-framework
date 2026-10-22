@@ -144,6 +144,24 @@ OpenCode and Codex read the same file, reconcile it with Git/source/project
 rules, then resume. `lastHarness` is diagnostic only. State must never contain
 sessions, transcripts, chain-of-thought, credentials, or secrets.
 
+## Automatic routing recovery
+
+An empty model class no longer stops a task when the provider has a capable
+model in the catalog and an existing adapter for the same role. Resolution
+selects the cheapest eligible recovery candidate, preserves the provider and
+capability floor, skips excluded failed models, and reports
+`selectionBasis: catalog-recovery`. Review and QA recover within their own role
+families. A stronger discovered OpenCode model now populates supported lower
+coding classes during sync, so a provider need not expose an economy-labelled
+model to implement a small task.
+
+Recovery does not rewrite routing files during a read-only resolve command.
+`agent-kit sync` materializes generated routes/agents under existing ownership
+and backup rules; refresh a stale catalog once with `sync --refresh-models`.
+No model ID, capability, price or authentication is invented. If no available
+capable executable candidate remains, report the actual missing capability.
+Approved activity fallback contracts remain enforced.
+
 ## Execution convergence
 
 After plan/task approval, execute all ready tasks in dependency order without

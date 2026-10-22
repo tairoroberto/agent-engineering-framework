@@ -473,6 +473,26 @@ class CopilotProviderTest(unittest.TestCase):
             self.assertEqual(custom, project_config.read_text())
             self.assertNotIn("--pure", (root / ".opencode/opencode.json").read_text())
 
+    def test_legacy_empty_coding_class_recovers_without_manual_routing_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "consumer"
+            root.mkdir()
+            self.run_cli(root, "init", "--profile", "flutter", "--harness", "opencode", "--provider", "copilot",
+                         "--memory-workspace", "tests", "--memory-project", root.name)
+            path = root / ".opencode/routing.json"
+            mapping = json.loads(path.read_text())
+            mapping["modelClasses"]["cost-efficient-coding"]["candidates"] = []
+            path.write_text(json.dumps(mapping))
+            before = path.read_bytes()
+            result = subprocess.run(["python3", str(FRAMEWORK / "state/routing.py"), "resolve-class", "opencode",
+                "modelClasses", "cost-efficient-coding", "--provider", "copilot"], cwd=root, text=True, capture_output=True)
+            self.assertEqual(0, result.returncode, result.stderr)
+            selected = json.loads(result.stdout)["exec"]
+            self.assertEqual("copilot", selected["provider"])
+            self.assertEqual("catalog-recovery", selected["selectionBasis"])
+            self.assertTrue((root / ".opencode/agents" / f"{selected['agent']}.md").is_file())
+            self.assertEqual(before, path.read_bytes())
+
     def test_env_check_reports_copilot_routes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "consumer"

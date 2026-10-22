@@ -31,7 +31,18 @@ retry indefinitely. Provider circuit breakers and external failures remain
 separate from this budget.
 
 For formal tasks, use the shared router to derive a portable `modelClass`, then
-resolve it through the active harness `routing.json`. Resolve Reviewer and QA
+resolve it through the active harness `routing.json`. An empty class is a
+routing gap, not proof of model incapability. The resolver automatically checks
+available catalog models with existing adapters in the same role family and
+selects the cheapest eligible one, retaining the task floor, named provider and
+excluded failures. Cost uses published/project rates when known, otherwise the
+declared cost tier; unknown prices are not claimed as measured savings.
+If the catalog model lacks an adapter, run `agent-kit sync` once to regenerate
+framework-owned candidates; refresh a stale catalog once with
+`agent-kit sync --refresh-models`. Preserve project-owned edits and reconcile
+stale execution contracts. Do not repeatedly refresh or hand-edit task risk,
+provider, required gates or failed-model exclusions to force a match.
+ Resolve Reviewer and QA
 through their `reviewClasses` and `qaClasses` with the same provider selector.
 The router prioritizes declared metadata, then valid persisted classification,
 then deterministic inference. Low-confidence inference blocks dispatch instead
@@ -53,8 +64,10 @@ same floor, but never lower capability, independence, security, or gates.
 
 A quota, rate-limit, unavailable-model, or context-window response is terminal for that child:
 do not retry it or wait indefinitely. Use only the fallback order already
-approved in the plan. A different fallback requires approval; a named provider
-stays strict and only `auto` may change provider. If the harness cannot cancel a
+approved in the plan, including its eligible provider-local alternatives.
+Repairing an empty class to an already covered capable model needs no extra
+confirmation. A model outside the approved activity still requires a reconciled
+proposal; a named provider stays strict and only `auto` may change provider. If the harness cannot cancel a
 pending child, record it as blocked/cancelled, prevent dependent dispatch, and
 tell the operator the exact UI cancellation needed. The launcher records only
 the failure category and reported retry delay. No candidate creates a

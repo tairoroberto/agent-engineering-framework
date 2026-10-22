@@ -18,3 +18,9 @@ Intent: resume a feature or engineering task without repeating reliable discover
 The framework state schema is portable; project extensions may add evidence but
 cannot make harness session data authoritative. Gate commands and closure
 authority remain project-owned.
+
+After plan/task approval, continue all ready tasks through implementation,
+relevant validation and bounded fixes without routine continuation questions.
+Apply `core/verification.md` for impact-selected checks, batched edits, evidence
+reuse and stopping after acceptance. Preserve project requirements and approval
+boundaries; pause for real blockers or material scope/risk changes only.

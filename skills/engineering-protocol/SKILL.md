@@ -28,3 +28,9 @@ FAIL instead of retrying it. Reviewer returns one `BLOCKER`/`MAJOR`/`MINOR`
 batch. The state execution policy, not a harness turn limit, bounds review/fix
 and no-progress loops. QA remains conditional on risk/task/project acceptance
 and only runs non-mutating verification.
+
+Execution default: after plan/task approval, continue ready tasks without
+routine continuation questions. `../../core/verification.md` selects only
+impact-relevant or explicitly required checks: batch edits, format touched
+supported files once if applicable, reuse evidence, fix concrete failures and
+rerun only invalidated checks. Stop after required acceptance passes.

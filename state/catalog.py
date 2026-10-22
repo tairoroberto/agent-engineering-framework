@@ -14,8 +14,10 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from . import opencode_compat
     from .model_router import ModelDescriptor
 except ImportError:
+    import opencode_compat
     from model_router import ModelDescriptor
 
 
@@ -46,7 +48,7 @@ HARNESS_CAPABILITIES = {
     "claude": {"modelDiscovery": False, "perInvocationModel": True, "reasoningEffort": True, "effectiveModelReceipt": True},
 }
 CLASS_ORDER = ("cost-efficient-coding", "balanced-coding", "strong-coding", "strongest-appropriate")
-MODEL_LINE = re.compile(r"(?<![A-Za-z0-9._/-])([A-Za-z0-9._-]+/[A-Za-z0-9._:@+-]+)(?![A-Za-z0-9._/-])")
+MODEL_LINE = re.compile(r"(?<![A-Za-z0-9._/-])([A-Za-z0-9._-]+/[A-Za-z0-9._:@+/-]+)(?![A-Za-z0-9._/-])")
 
 
 def now() -> str:
@@ -320,6 +322,15 @@ def probe_native_providers(root: Path, harness: str, providers: list[str]) -> li
     if harness != "opencode":
         return []
     executable = EXECUTABLES[harness]
+    if opencode_compat.installed_major(root) == 2:
+        code, output = run_discovery([executable, "models", "--standalone"], executable, root, timeout=30)
+        if code != 0:
+            return []
+        return [
+            {"id": model, "provider": normalize_provider(model.split("/", 1)[0], harness)}
+            for model in dict.fromkeys(MODEL_LINE.findall(output))
+            if normalize_provider(model.split("/", 1)[0], harness) in providers
+        ]
     merged: list[dict[str, Any]] = []
     for provider in providers:
         for native in NATIVE_PROVIDER_IDS.get(provider, (provider,)):
@@ -357,13 +368,14 @@ def discover_models(root: Path, harness: str, *, providers_hint: list[str] | Non
         return entries, "environment"
     executable = EXECUTABLES[harness]
     found: list[dict[str, Any]] = []
-    verbose = discovery_verbose_command(harness)
+    v2 = harness == "opencode" and opencode_compat.installed_major(root) == 2
+    verbose = None if v2 else discovery_verbose_command(harness)
     if verbose is not None:
         returncode, stdout = run_discovery(verbose, executable, root, timeout=30)
         if returncode == 0 and stdout.strip():
             found = parse_verbose_models(stdout, harness)
     if not found:
-        command = discovery_command(harness)
+        command = ["opencode", "models", "--standalone"] if v2 else discovery_command(harness)
         returncode, stdout = run_discovery(command, executable, root, timeout=30)
         if returncode is not None and returncode == 0:
             models = list(dict.fromkeys(MODEL_LINE.findall(stdout)))
@@ -371,7 +383,7 @@ def discover_models(root: Path, harness: str, *, providers_hint: list[str] | Non
                 {"id": model, "provider": normalize_provider(model.split("/", 1)[0] if "/" in model else harness, harness)}
                 for model in models
             ]
-    if not found and providers_hint:
+    if not found and providers_hint and not v2:
         found = probe_native_providers(root, harness, providers_hint)
     if not found:
         return [], None
@@ -399,6 +411,15 @@ def provider_discovery_status(root: Path, harness: str, provider: str) -> dict[s
     native_ids = NATIVE_PROVIDER_IDS.get(provider, (provider,))
     probed = False
     found: set[str] = set()
+    if harness == "opencode" and opencode_compat.installed_major(root) == 2:
+        code, output = run_discovery(["opencode", "models", "--standalone"], EXECUTABLES[harness], root, timeout=30)
+        found = {
+            model for model in MODEL_LINE.findall(output)
+            if normalize_provider(model.split("/", 1)[0], harness) == provider
+        } if code == 0 else set()
+        return {"harness": harness, "provider": provider,
+                "state": "available" if found else "no-models" if code == 0 else "provider-unavailable",
+                "models": sorted(found)}
     if harness == "opencode":
         for native in native_ids:
             returncode, stdout = run_discovery(["opencode", "models", native], EXECUTABLES[harness], root)

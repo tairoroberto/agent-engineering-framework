@@ -115,8 +115,8 @@ strict = true
 
 Re-running `agent-kit init --force` without `--provider` reuses the persisted
 policy, like other persisted settings. Copilot models are discovered
-dynamically through the officially supported `opencode models --verbose`
-interface (`github-copilot` is normalized to the framework provider
+dynamically through `opencode models --verbose` on V1 and
+`opencode models --standalone` on V2 with local provider filtering (`github-copilot` is normalized to the framework provider
 `copilot`); nothing is hardcoded because entitlements vary by company,
 account, plan, policy, and region.
 
@@ -432,3 +432,6 @@ the existing catalog and `ModelRouter`, and the existing proposal/approval
 flow. It must not hardcode model IDs, create a second registry, bypass
 approval, or invent a parallel provider-discovery path. Paid/model-backed
 pre-proposal calls require a separately approved cost and security contract.
+
+See [OpenCode 1/2 compatibility](opencode-compatibility.md) for agent, skill,
+permission, CLI and plugin migration checks.

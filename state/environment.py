@@ -18,6 +18,11 @@ import subprocess
 import tempfile
 from typing import Callable, Optional, Protocol, Sequence
 
+try:
+    from .opencode_compat import version_major, read_jsonc
+except ImportError:
+    from opencode_compat import version_major, read_jsonc
+
 
 class RequirementStatus(str, Enum):
     """A requirement outcome with enough detail to choose a safe repair."""
@@ -434,21 +439,20 @@ def safe_file_contains(path: Path, value: str) -> bool:
 def json_mcp_server_configured(path: Path, *, top_level_servers: bool = False) -> bool:
     """Recognize a named MCP server structurally without exposing config values."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        data = read_jsonc(path)
+    except (OSError, UnicodeError, ValueError):
         return False
-    if not isinstance(data, dict):
-        return False
+    def active(servers: object) -> bool:
+        entry = servers.get("ai-memory") if isinstance(servers, dict) else None
+        return isinstance(entry, dict) and entry.get("enabled") is not False and entry.get("disabled") is not True
     if top_level_servers:
-        servers = data.get("servers")
-        return isinstance(servers, dict) and "ai-memory" in servers
+        return active(data.get("servers"))
     mcp = data.get("mcp")
     if not isinstance(mcp, dict):
         return False
     if "ai-memory" in mcp:
-        return True
-    servers = mcp.get("servers")
-    return isinstance(servers, dict) and "ai-memory" in servers
+        return active(mcp)
+    return active(mcp.get("servers"))
 
 
 def json_codex_ai_memory_hooks_configured(path: Path) -> bool:
@@ -653,10 +657,21 @@ class AiMemoryRequirement(EnvironmentRequirement):
                 CheckResult("codex-hooks", "Codex hooks", RequirementStatus.OK if hooks else RequirementStatus.MISSING, "configured" if hooks else "missing"),
             )
         if harness == "opencode":
-            config = context.home / ".config" / "opencode" / "opencode.json"
-            plugin = context.home / ".config" / "opencode" / "plugins" / "ai-memory.ts"
-            mcp = json_mcp_server_configured(config)
+            config_root = context.home / ".config" / "opencode"
+            configs = [config_root / "opencode.json", config_root / "opencode.jsonc"]
+            mcp = any(json_mcp_server_configured(path) for path in configs)
+            plugin = config_root / "plugins" / "ai-memory.ts"
             hooks = safe_file_contains(plugin, "ai-memory")
+            binary = context.executable_finder("opencode")
+            major = version_major(command_version(context, binary) or "") if binary else None
+            if major == 2:
+                # MCP presence and plugin lifecycle compatibility are independent.
+                # A legacy TypeScript filename/content is no proof of V2 setup.
+                return (
+                    CheckResult("opencode-mcp", "OpenCode MCP", RequirementStatus.OK if mcp else RequirementStatus.MISSING, "configured" if mcp else "missing"),
+                    CheckResult("opencode-hooks", "OpenCode lifecycle", RequirementStatus.PARTIAL,
+                                "OpenCode 2 plugin API requires runtime verification; legacy ai-memory.ts presence is insufficient"),
+                )
             return (
                 CheckResult("opencode-mcp", "OpenCode MCP", RequirementStatus.OK if mcp else RequirementStatus.MISSING, "configured" if mcp else "missing"),
                 CheckResult("opencode-hooks", "OpenCode lifecycle", RequirementStatus.OK if hooks else RequirementStatus.MISSING, "configured" if hooks else "missing"),
@@ -756,7 +771,7 @@ class AiMemoryRequirement(EnvironmentRequirement):
                     self.id,
                     self._integration_preview(context, self._binary(context) or "ai-memory", harness, "mcp"),
                 ))
-            if harness != "copilot" and f"{harness}-hooks" in by_id and by_id[f"{harness}-hooks"].status != RequirementStatus.OK:
+            if harness != "copilot" and f"{harness}-hooks" in by_id and by_id[f"{harness}-hooks"].status not in (RequirementStatus.OK, RequirementStatus.PARTIAL):
                 actions.append(RepairAction(
                     f"ai-memory:{harness}-hooks",
                     f"Configure ai-memory lifecycle integration for {harness.title()}",
@@ -778,6 +793,10 @@ class AiMemoryRequirement(EnvironmentRequirement):
             if harness == "copilot":
                 command += f" --config-file {context.root / '.vscode' / 'mcp.json'}"
             return (command,)
+        if harness == "opencode":
+            executable = context.executable_finder("opencode")
+            if executable and version_major(command_version(context, executable) or "") == 2:
+                return ("Manual verification required: ai-memory lifecycle plugin must support the OpenCode 2 API",)
         return (f"{binary} install-hooks --agent {harness} --apply",)
 
     def _install_macos(self, context: EnvironmentContext, platform: PlatformInfo) -> OperationResult:
@@ -887,6 +906,10 @@ class AiMemoryRequirement(EnvironmentRequirement):
             return OperationResult(f"ai-memory:{harness}-{capability}", False, "unsupported harness")
         if harness == "copilot" and capability == "hooks":
             return OperationResult("ai-memory:copilot-hooks", True, "not supported by Copilot")
+        if harness == "opencode" and capability == "hooks":
+            executable = context.executable_finder("opencode")
+            if executable and version_major(command_version(context, executable) or "") == 2:
+                return OperationResult("ai-memory:opencode-hooks", False, "OpenCode 2 lifecycle requires a verified V2 plugin; legacy hook installation was not run")
         if capability == "mcp":
             client = "vscode-copilot" if harness == "copilot" else harness
             argv: tuple[str, ...] = (binary, "install-mcp", "--client", client, "--apply")

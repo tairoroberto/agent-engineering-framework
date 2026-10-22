@@ -11,3 +11,9 @@ Intent: take a product or technical feature from requested outcome to proportion
 7. Record only authorized durable memory and leave a compact handoff when continuation is needed.
 
 Do not force ceremony, delegation, or a full memory read for trivial work.
+
+After plan/task approval, continue all ready tasks through implementation,
+relevant validation and bounded fixes without routine continuation questions.
+Apply `core/verification.md` for impact-selected checks, batched edits, evidence
+reuse and stopping after acceptance. Preserve project requirements and approval
+boundaries; pause for real blockers or material scope/risk changes only.

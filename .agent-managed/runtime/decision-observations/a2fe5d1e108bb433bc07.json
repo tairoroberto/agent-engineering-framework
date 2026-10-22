@@ -1,0 +1,1 @@
+{"authoritativeDecision":{},"confidence":0.0,"correlationId":"a2fe5d1e108bb433bc07","feature":"decision-plane","kind":"DecisionShadowObservation","mismatch":{},"phase":"pre_execution","policyRecommendation":{"executionTier":"FRONTIER"},"profile":{"available":true},"provider":{"id":"deterministic-safe","model":null},"schemaVersion":1,"task":"observation","usage":{}}

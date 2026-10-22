@@ -499,6 +499,42 @@ class AgentKitTest(unittest.TestCase):
             self.assertEqual((root / "AGENTS.md").read_text(encoding="utf-8"), agents_after_init)
             self.assertEqual((managed / "metadata.toml").read_bytes(), metadata)
 
+    def test_opencode_major_switch_preserves_shared_adapters_and_project_extensions(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            root = base / "consumer"
+            root.mkdir()
+            binary_dir = base / "bin"
+            binary_dir.mkdir()
+            binary = binary_dir / "opencode"
+            env = {**os.environ, "PATH": str(binary_dir) + os.pathsep + os.environ.get("PATH", "")}
+            # Injection keeps this acceptance test offline; native discovery is
+            # exercised separately for both CLI contracts and real binaries.
+            env["AGENT_KIT_OPENCODE_MODELS"] = "opencode/nemotron-3-ultra-free"
+            binary.write_text('#!/bin/sh\nif [ "$1" = "--version" ]; then echo "1.3.17"; exit 0; fi\nexit 1\n')
+            binary.chmod(0o755)
+            self.run_cli(root, "init", "--profile", "generic", "--harness", "opencode", env=env)
+            first = self.run_cli(root, "doctor", env=env)
+            self.assertIn("OPENCODE_COMPAT: V1", first.stdout)
+            config = root / ".opencode/opencode.json"
+            before = config.read_bytes()
+            extension = root / "opencode.jsonc"
+            custom = '{ // project-owned\n "plugin": ["custom-memory"], "lsp": {"custom": {}}\n}\n'
+            extension.write_text(custom)
+            binary.write_text('#!/bin/sh\nif [ "$1" = "--version" ]; then echo "opencode v2.1.2"; exit 0; fi\nexit 1\n')
+            self.run_cli(root, "sync", env=env)
+            result = self.run_cli(root, "doctor", env=env)
+            self.assertIn("OPENCODE_COMPAT: V2", result.stdout)
+            self.assertIn("plugin API changed", result.stdout)
+            self.assertIn("no LSP runtime", result.stdout)
+            self.assertEqual(before, config.read_bytes())
+            self.assertEqual(custom, extension.read_text())
+            developer = root / ".opencode/agents/developer.md"
+            developer.write_text(developer.read_text().replace("mode: subagent", "mode: primary"))
+            result = self.run_cli(root, "doctor", env=env, check=False)
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("OpenCode agent mode invalid: developer", result.stdout)
+
     def test_init_backs_up_existing_opencode_workflow_and_sync_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "consumer"
@@ -1642,7 +1678,8 @@ class AgentKitTest(unittest.TestCase):
 
     def write_fake_executable(self, directory: Path, name: str, body: str) -> None:
         path = directory / name
-        path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+        version = 'if [ "$1" = "--version" ]; then echo "1.2.3"; exit 0; fi\n' if name == "opencode" else ""
+        path.write_text("#!/bin/sh\n" + version + body, encoding="utf-8")
         path.chmod(0o755)
 
     def run_cli(

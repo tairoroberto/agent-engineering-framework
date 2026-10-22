@@ -4,6 +4,19 @@ Progressive load: project rules -> manifest -> relevant framework capability -> 
 
 Orchestrator decides single-agent or delegated execution. Simple, clear work stays single-agent. Delegate only for independent exploration/review/verification, isolated implementation, specialist analysis, or meaningful uncertainty reduction.
 
+Once the implementation plan and tasks are accepted, execute all ready tasks in
+dependency order through completion, relevant validation and bounded fixes. Do
+not stop after each task to ask whether to continue, replan accepted work, or
+rediscover unchanged context. Pause only for a real blocker, a material scope or
+risk change, or an action outside the existing authorization. Reuse an unchanged
+approved model/dispatch contract; this does not bypass stale-plan checks or
+authorize unapproved models, providers or external actions.
+
+Choose verification from impact, not tool availability. Group related edits
+before routine checks, reuse current evidence and stop when acceptance passes.
+`core/verification.md` owns gate selection and rerun rules. Keep progress and
+closure compact: changed behavior, relevant evidence and actual blockers only.
+
 Dispatch includes goal, bounded ownership, dependencies, expected evidence, verification gate, write/commit authority. Orchestrator alone reconciles shared task state and integrates results. Subagents never redefine scope.
 
 Classify complexity (LOW/MEDIUM/HIGH) separately from risk (LOW/MEDIUM/HIGH/CRITICAL). Capability/risk floors can raise model or verification depth; budget mode cannot lower them. Parallel work requires passed dependencies, explicit parallel intent, disjoint write/conflict boundaries, and capacity. Missing evidence or uncertain conflict means sequential.

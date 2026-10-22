@@ -21,9 +21,10 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import catalog, routing
+    from . import catalog, routing, opencode_compat
     from .model_router import ModelRouter, NoCapableModel, ROLE_BUDGETS, compress_tool_output
 except ImportError:
+    import opencode_compat
     import catalog
     import routing
     from model_router import ModelRouter, NoCapableModel, ROLE_BUDGETS, compress_tool_output
@@ -951,7 +952,8 @@ def execution_command(root: Path, route: dict[str, Any], capsule: dict[str, Any]
     if not binary:
         raise ValueError(f"HARNESS_UNAVAILABLE: {harness} executable was not found")
     if harness == "opencode":
-        return [binary, "run", "--format", "json", "--agent", route["agent"], "--model", route["model"], payload]
+        standalone = ["--standalone"] if opencode_compat.installed_major(root) == 2 else []
+        return [binary, "run", *standalone, "--format", "json", "--agent", route["agent"], "--model", route["model"], payload]
     if harness == "codex":
         return [binary, "exec", "--json", "--model", route["model"], payload]
     if harness == "claude":

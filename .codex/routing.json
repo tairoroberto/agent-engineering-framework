@@ -1,0 +1,63 @@
+{
+  "schemaVersion": 1,
+  "modelClasses": {
+    "cost-efficient-coding": {
+      "agent": "developer-low",
+      "model": "gpt-5.6-luna",
+      "reasoningEffort": "low",
+      "provider": "openai"
+    },
+    "balanced-coding": {
+      "agent": "developer-medium",
+      "model": "gpt-5.5",
+      "reasoningEffort": "low",
+      "provider": "openai"
+    },
+    "strong-coding": {
+      "agent": "developer-high",
+      "model": "gpt-5.6-sol",
+      "reasoningEffort": "medium",
+      "provider": "openai"
+    },
+    "strongest-appropriate": {
+      "agent": "developer-high",
+      "model": "gpt-5.6-sol",
+      "reasoningEffort": "medium",
+      "provider": "openai"
+    }
+  },
+  "reviewClasses": {
+    "independent-reviewer": {
+      "agent": "reviewer",
+      "model": "gpt-5.6-terra",
+      "reasoningEffort": "medium",
+      "provider": "openai"
+    },
+    "specialist-review": {
+      "agent": "reviewer",
+      "model": "gpt-5.6-sol",
+      "reasoningEffort": "medium",
+      "provider": "openai"
+    }
+  },
+  "qaClasses": {
+    "qa-basic": {
+      "agent": "qa",
+      "model": "gpt-5.6-luna",
+      "reasoningEffort": "low",
+      "provider": "openai"
+    },
+    "qa-targeted": {
+      "agent": "qa",
+      "model": "gpt-5.6-terra",
+      "reasoningEffort": "low",
+      "provider": "openai"
+    },
+    "qa-adversarial": {
+      "agent": "qa",
+      "model": "gpt-5.6-sol",
+      "reasoningEffort": "low",
+      "provider": "openai"
+    }
+  }
+}

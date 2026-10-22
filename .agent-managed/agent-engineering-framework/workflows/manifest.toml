@@ -1,0 +1,14 @@
+[[workflow]]
+name = "continue"
+description = "Resume engineering work from current evidence."
+shared = true
+
+[[workflow]]
+name = "feature"
+description = "Plan and implement a feature with proportionate engineering rigor."
+shared = true
+
+[[workflow]]
+name = "review"
+description = "Independently assess a change; review is distinct from verification."
+shared = true

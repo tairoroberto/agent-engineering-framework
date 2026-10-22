@@ -28,6 +28,7 @@ for _path in (str(FRAMEWORK), str(STATE_DIR)):
     while _path in sys.path:
         sys.path.remove(_path)
 sys.path.insert(0, str(FRAMEWORK))
+from state import opencode_compat
 from state import catalog as model_catalog  # noqa: E402
 from state import activity as activity_runtime  # noqa: E402
 from state import environment as environment_runtime  # noqa: E402
@@ -65,6 +66,15 @@ OPEN_TASK_STATUSES = {
     "pending", "ready", "implementing", "gates", "reviewing", "fixing",
     "qa", "blocked", "escalated", "in_progress", "failed",
 }
+
+
+DIRECT_EXECUTION_GUIDANCE = (
+    "Follow `.agent-managed/agent-engineering-framework/core/verification.md`: "
+    "continue approved ready tasks without routine continuation questions. "
+    "Complete related edits, then run only impact-selected or explicitly required checks. "
+    "Format changed supported files once when applicable; reuse valid evidence and rerun only checks invalidated by concrete fixes. "
+    "Stop after acceptance passes. Preserve role boundaries and approved dispatch contracts."
+)
 
 
 def qa_gate_permissions(profile: str) -> str:
@@ -183,11 +193,14 @@ def opencode_agent(role: str, mode: str, model: str, read_only: bool = False, *,
     "git clean*": deny
     "git rebase*": deny
     "git commit --amend*": deny'''.replace("TASK_PERMISSION", "deny").replace("BASH_PERMISSION", "ask")
+    # V2 allows external directories by default. Make the V1 boundary explicit
+    # in each agent so normalization cannot silently widen workspace access.
+    permissions += "\n  external_directory: ask"
     instructions = {
         "orchestrator": "Own decomposition, dependencies, canonical state/evidence reconciliation, review loop, QA, and final integration. Delegate all production work; never edit production code. Every dispatch includes owned paths or a diff boundary. For formal tasks, honor the workflow provider selector. Resolve production with `resolve <tasks.md> <task> opencode --provider <name>`; resolve Reviewer/QA with `resolve-class opencode <reviewClasses|qaClasses> <class> --provider <name>`. Every returned JSON is a hard dispatch contract: call only `exec.agent`, include `PROVIDER: exec.provider` in the Task payload, and stop if its provider differs from the requested provider. The provider constraint applies to Developer, Reviewer, and QA. A global gate failure only outside that boundary is `EXTERNAL_DIRTY_WORKTREE`: it blocks clean-worktree release evidence, not the evaluated task; never ask QA to edit/revert it. A quota/rate-limit/unavailable error is terminal for that child: do not ask it to retry or wait indefinitely. Immediately resolve again with `--exclude-model <failed-model>` and dispatch only the next candidate, retaining a named provider; `auto` may change provider. If the active harness cannot cancel an already pending child, mark it cancelled/blocked in canonical state, dispatch no dependent work, and report the required UI cancellation. No candidate is a blocker. Resolve project gates from profile and project rules.",
         "planner": "Write only scoped specification, design, and task artifacts when required. Never edit canonical state/validation evidence, implement production code, or redefine project architecture.",
-        "developer-low": "Implement one bounded low-complexity task and add relevant tests. Run discovered development gates for the task scope: format when it can change touched files, then analysis/lint and focused tests. Return compact gate evidence and Developer Closure facts to the Orchestrator; never write planning/state artifacts.",
-        "developer": "Implement one bounded task and add relevant tests. Run discovered development gates for the task scope: format when it can change touched files, then analysis/lint and focused tests. Return compact gate evidence and Developer Closure facts to the Orchestrator; never write planning/state artifacts.",
+        "developer-low": "Implement one bounded low-complexity task. Add tests only for changed behavior that needs coverage. Run discovered development gates only when relevant to the changed scope or explicitly required; no automatic format/analyze/test sequence. Return compact gate evidence and Developer Closure facts to the Orchestrator; never write planning/state artifacts.",
+        "developer": "Implement one bounded task. Add tests only for changed behavior that needs coverage. Run discovered development gates only when relevant to the changed scope or explicitly required; no automatic format/analyze/test sequence. Return compact gate evidence and Developer Closure facts to the Orchestrator; never write planning/state artifacts.",
         "developer-high": "Implement one bounded high-risk task. Assess integrity, concurrency, compatibility, rollback, and failures. Run the project-required development gates and return compact closure evidence to the Orchestrator; never write planning/state artifacts.",
         "developer-critical": "Implement one bounded critical-risk task. Escalate missing evidence or unsafe assumptions. Run the project-required development gates and return compact closure evidence to the Orchestrator; never write planning/state artifacts.",
         "reviewer": "Fresh independent reviewer. Read-only. Return ranked, evidence-bearing findings to the Orchestrator; never fix code or self-approve.",
@@ -202,10 +215,12 @@ reasoningEffort: {role_effort(resolved_base)}
 {permissions}
 ---
 
+OpenCode 1/2: use Task (`task`) on V1 and `subagent` on V2 for delegation; shell is `bash` on V1 and `shell` on V2. Keep the same dispatch contract and role boundaries. V2 has no LSP runtime: use project analysis/compiler gates.
 Route: harness=opencode provider={execution_provider} model="{model}" role={resolved_base}
 Start only from this fresh dispatch. Do not resume, fork, or request an earlier agent conversation. Load the dispatched role capsule, current project AGENTS.md, and only the relevant shared protocol/profile sections.
 {instructions}
 {provider_guard}
+{DIRECT_EXECUTION_GUIDANCE}
 Use Caveman handoffs: facts, paths, requirements, commands, results, risks, open items. Do not invent project commands or business rules.
 '''
 
@@ -219,6 +234,7 @@ sandbox_mode = "{sandbox}"
 developer_instructions = """
 Start only from this fresh dispatch. Do not resume, fork, or request an earlier agent conversation. Load the dispatched role capsule, project AGENTS.md, and only relevant shared protocol/profile sections.
 {instruction}
+{DIRECT_EXECUTION_GUIDANCE}
 Use compact evidence. Never invent project gates, architecture, or domain policy.
 """
 '''
@@ -270,6 +286,7 @@ disable-model-invocation: true
 Start only from this fresh dispatch. Do not resume, fork, or request an earlier agent conversation. Load the compact role capsule, project AGENTS.md, and only relevant managed protocol sections.
 Requested effort is `{effort}` in the approved DispatchPlan; Copilot has no portable agent-frontmatter effort field, so verify the effective execution receipt.
 {restriction}
+{DIRECT_EXECUTION_GUIDANCE}
 Return facts, paths, commands, results, risks, and open items. Never persist reasoning or transcripts.
 '''
 
@@ -288,6 +305,7 @@ tools: {tools}
 
 Start only from this fresh dispatch. Do not resume, fork, or request an earlier agent conversation. Load the compact role capsule, project AGENTS.md, and only relevant managed protocol sections.
 {restriction}
+{DIRECT_EXECUTION_GUIDANCE}
 Return compact evidence without transcripts or hidden reasoning.
 '''
 
@@ -469,7 +487,7 @@ def harness_templates(
             "config.toml": "# agent-framework-harness: codex-config\n[agents]\nenabled = true\nmax_concurrent_threads_per_session = 3\n",
             "routing.json": json.dumps(routes, indent=2) + "\n",
         }
-        roles = (("orchestrator", orchestrator_model or "gpt-5.6-sol", "low", "workspace-write", "Shared task conductor.", "Own decomposition, dependencies, canonical state/evidence, review/verification, and final integration. Before dispatch, present the model-selection proposal and wait for approval. Delegate all production work; never edit production code."), ("planner", "gpt-5.6-sol", "medium", "workspace-write", "Shared specification planner.", "Write scoped planning artifacts only; never edit canonical state/validation evidence or production code."), ("developer_low", "gpt-5.6-luna", "low", "workspace-write", "Low-complexity task implementer.", "Implement one dispatched task and relevant tests. Run discovered format, analysis/lint, and focused tests where required before review; never edit .specs artifacts. Return compact closure evidence to the Orchestrator."), ("developer_medium", "gpt-5.5", "low", "workspace-write", "Medium-complexity task implementer.", "Implement one dispatched task and relevant tests. Run discovered development gates before review; never edit .specs artifacts. Return compact closure evidence to the Orchestrator."), ("developer_high", "gpt-5.6-sol", "medium", "workspace-write", "High-risk task implementer.", "Implement one dispatched task and relevant tests. Assess integrity, compatibility, concurrency, and rollback where relevant. Run project-required development gates and return compact closure evidence; never edit .specs artifacts."), ("reviewer", "gpt-5.6-terra", "medium", "read-only", "Independent read-only reviewer.", "Review independently; return one complete, evidence-bearing finding batch only. Never edit, self-approve, or write project artifacts."), ("qa", "gpt-5.6-luna", "low", "read-only", "Independent read-only QA.", "Execute approved non-mutating verification and evaluate acceptance/failure evidence independently. Never edit, format, refactor, or write project artifacts."))
+        roles = (("orchestrator", orchestrator_model or "gpt-5.6-sol", "low", "workspace-write", "Shared task conductor.", "Own decomposition, dependencies, canonical state/evidence, review/verification, and final integration. Before dispatch, present the model-selection proposal and wait for approval. Delegate all production work; never edit production code."), ("planner", "gpt-5.6-sol", "medium", "workspace-write", "Shared specification planner.", "Write scoped planning artifacts only; never edit canonical state/validation evidence or production code."), ("developer_low", "gpt-5.6-luna", "low", "workspace-write", "Low-complexity task implementer.", "Implement one dispatched task and relevant tests. Run only impact-selected or explicitly required development gates before review; never edit .specs artifacts. Return compact closure evidence to the Orchestrator."), ("developer_medium", "gpt-5.5", "low", "workspace-write", "Medium-complexity task implementer.", "Implement one dispatched task and relevant tests. Run discovered development gates before review; never edit .specs artifacts. Return compact closure evidence to the Orchestrator."), ("developer_high", "gpt-5.6-sol", "medium", "workspace-write", "High-risk task implementer.", "Implement one dispatched task and relevant tests. Assess integrity, compatibility, concurrency, and rollback where relevant. Run project-required development gates and return compact closure evidence; never edit .specs artifacts."), ("reviewer", "gpt-5.6-terra", "medium", "read-only", "Independent read-only reviewer.", "Review independently; return one complete, evidence-bearing finding batch only. Never edit, self-approve, or write project artifacts."), ("qa", "gpt-5.6-luna", "low", "read-only", "Independent read-only QA.", "Execute approved non-mutating verification and evaluate acceptance/failure evidence independently. Never edit, format, refactor, or write project artifacts."))
         templates.update({f"agents/{role[0].replace('_', '-')}.toml": codex_agent(*role) for role in roles})
         return templates
     if harness == "copilot":
@@ -2286,6 +2304,15 @@ def command_doctor(args: argparse.Namespace) -> None:
                 if actual != content:
                     errors.append(f"{harness} adapter missing or stale: {target.relative_to(root)}")
         if harness == "opencode":
+            major = opencode_compat.installed_major(root)
+            print(f"OPENCODE_COMPAT: {('V' + str(major)) if major else 'version-unverified'} (shared V1/V2 adapters)")
+            if major is not None and major not in (1, 2):
+                errors.append(f"OpenCode major version unsupported: {major}")
+            elif major is None:
+                warnings.append("OpenCode version could not be verified; native runtime compatibility is unverified")
+            warnings.extend(opencode_compat.configuration_warnings(root, major))
+            if data.get("harness", {}).get("managed_adapters", True):
+                errors.extend(opencode_compat.validate_adapters(root))
             for workflow in WORKFLOWS:
                 command = root / ".opencode" / "commands" / f"{workflow}.md"
                 command_text = command.read_text(encoding="utf-8") if command.is_file() else ""

@@ -132,6 +132,8 @@ Codex, OpenCode, Copilot, and Claude Code load the same managed core; adapters d
 
 `skills/engineering-protocol` is the single shared protocol activation point. It composes canonical `core/` policy rather than duplicating it. Technology profiles and project extensions supply only their own layer.
 
+OpenCode 1 and 2 share the same generated adapters. The framework detects the installed major for model discovery and isolated V2 dispatch, and `doctor` checks agent/skill contracts and migration risks. See [OpenCode compatibility](docs/opencode-compatibility.md) for validation commands and plugin limitations.
+
 ## Portable state and cross-harness continuation
 
 The framework default stores compact, harness-neutral work state in
@@ -144,10 +146,16 @@ sessions, transcripts, chain-of-thought, credentials, or secrets.
 
 ## Execution convergence
 
+After plan/task approval, execute all ready tasks in dependency order without
+routine continuation questions. Complete related edits before routine checks;
+run only checks that cover changed behavior or explicit project requirements.
+Gate classes are options, not a format/analyze/test/build checklist. Format only
+changed supported files once when applicable. Reuse current evidence, batch
+concrete fixes, rerun only invalidated checks, and stop after acceptance passes.
+
 Developer Closure proves technical readiness, not review approval. The
-Developer runs project-selected format, analysis/lint, and focused tests for
-the task scope, then records compact evidence before review. Reviewer remains
-read-only and returns one `BLOCKER`/`MAJOR`/`MINOR` batch. QA remains
+Developer records compact evidence for the selected gates before review.
+Reviewer remains read-only and returns one `BLOCKER`/`MAJOR`/`MINOR` batch. QA remains
 non-mutating and is dispatched only when risk, task gates, project policy, or
 acceptance requires it.
 

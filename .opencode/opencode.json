@@ -1,0 +1,11 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "default_agent": "orchestrator",
+  "skills": {
+    "paths": [
+      "~/.agents/skills/tlc-spec-driven",
+      "~/.agents/skills/caveman",
+      ".agent-managed/agent-engineering-framework/skills"
+    ]
+  }
+}

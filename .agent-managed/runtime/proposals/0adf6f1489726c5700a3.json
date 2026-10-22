@@ -1,0 +1,426 @@
+{
+  "availableHarnesses": [
+    "opencode",
+    "codex"
+  ],
+  "classification": {
+    "confidence": "HIGH",
+    "reasons": [
+      "task metadata"
+    ],
+    "source": "declared"
+  },
+  "contextCapsule": {
+    "acceptanceCriteria": [
+      "required-tests",
+      "independent-review",
+      "qa-adversarial"
+    ],
+    "decisions": [],
+    "dependencies": [
+      "T011"
+    ],
+    "developerClosure": null,
+    "gates": [
+      "task-gates",
+      "reviewer",
+      "qa-targeted",
+      "required-tests",
+      "independent-review",
+      "qa-adversarial",
+      "build"
+    ],
+    "knownFailures": [],
+    "objective": "Register assets and run full foundation validation",
+    "paths": [
+      "scripts/validate_framework.py"
+    ]
+  },
+  "createdAt": "2026-09-29T18:13:22+00:00",
+  "feature": "decision-plane-foundation",
+  "harness": "opencode",
+  "inputs": {
+    "catalog": "ebe4aa2376c43d22d03b98df1be8a23f52fa542f243d591ba086a385842dda72",
+    "state": "d76c2854552e623069eeb2cc454c06565035f84800ccafeb21eddc950a0397d1",
+    "tasks": "71310d4b5fbe9cd0c74125dc2452b375fcf7f893ec124e845bdb557594fb060e"
+  },
+  "kind": "ModelProposal",
+  "proposalId": "0adf6f1489726c5700a3",
+  "provider": "openai",
+  "roles": [
+    {
+      "alternatives": [
+        {
+          "agent": "orchestrator",
+          "class": "premium",
+          "costTier": "PREMIUM",
+          "disabledReason": null,
+          "eligible": true,
+          "estimate": {
+            "cost": null,
+            "costMicrounits": null,
+            "costUnknown": true,
+            "samples": 0,
+            "tokens": null
+          },
+          "model": "openai/gpt-5.6-sol",
+          "provider": "openai",
+          "reasoningEffort": "low"
+        }
+      ],
+      "crossHarnessAlternatives": [],
+      "family": "modelClasses",
+      "floor": "capability-first",
+      "justification": "best available reasoning/tool balance within provider",
+      "locked": false,
+      "recommended": {
+        "agent": "orchestrator",
+        "class": "premium",
+        "costTier": "PREMIUM",
+        "disabledReason": null,
+        "eligible": true,
+        "estimate": {
+          "cost": null,
+          "costMicrounits": null,
+          "costUnknown": true,
+          "samples": 0,
+          "tokens": null
+        },
+        "model": "openai/gpt-5.6-sol",
+        "provider": "openai",
+        "reasoningEffort": "low"
+      },
+      "role": "orchestrator",
+      "routing": {
+        "budgets": {
+          "context": "HIGH",
+          "output": "MEDIUM",
+          "reasoning": "HIGH"
+        },
+        "costTier": "PREMIUM",
+        "estimatedCost": null,
+        "estimatedInputTokens": 12000,
+        "estimatedOutputTokens": 4000,
+        "provider": "openai",
+        "rationale": "best available reasoning/tool balance within provider",
+        "requiredCapabilities": [
+          "reasoning",
+          "tools"
+        ],
+        "role": "orchestrator",
+        "selectedModel": "openai/gpt-5.6-sol",
+        "selectionStrategy": "CAPABILITY_FIRST"
+      }
+    },
+    {
+      "alternatives": [
+        {
+          "agent": "developer-openai",
+          "class": "standard",
+          "costTier": "STANDARD",
+          "disabledReason": null,
+          "eligible": true,
+          "estimate": {
+            "cost": null,
+            "costMicrounits": null,
+            "costUnknown": true,
+            "samples": 0,
+            "tokens": null
+          },
+          "model": "openai/gpt-5.5",
+          "provider": "openai",
+          "reasoningEffort": "low"
+        },
+        {
+          "agent": "developer-low-openai",
+          "class": "standard",
+          "costTier": "STANDARD",
+          "disabledReason": null,
+          "eligible": true,
+          "estimate": {
+            "cost": null,
+            "costMicrounits": null,
+            "costUnknown": true,
+            "samples": 0,
+            "tokens": null
+          },
+          "model": "openai/gpt-5.6-luna",
+          "provider": "openai",
+          "reasoningEffort": "low"
+        },
+        {
+          "agent": "developer-high-openai",
+          "class": "premium",
+          "costTier": "PREMIUM",
+          "disabledReason": null,
+          "eligible": true,
+          "estimate": {
+            "cost": null,
+            "costMicrounits": null,
+            "costUnknown": true,
+            "samples": 0,
+            "tokens": null
+          },
+          "model": "openai/gpt-5.6-sol",
+          "provider": "openai",
+          "reasoningEffort": "low"
+        },
+        {
+          "agent": "developer-critical-openai",
+          "class": "premium",
+          "costTier": "PREMIUM",
+          "disabledReason": null,
+          "eligible": true,
+          "estimate": {
+            "cost": null,
+            "costMicrounits": null,
+            "costUnknown": true,
+            "samples": 0,
+            "tokens": null
+          },
+          "model": "openai/gpt-6-astra",
+          "provider": "openai",
+          "reasoningEffort": "low"
+        }
+      ],
+      "crossHarnessAlternatives": [],
+      "family": "modelClasses",
+      "floor": "cost-first",
+      "justification": "cheapest available model satisfying coding+tools",
+      "locked": false,
+      "recommended": {
+        "agent": "developer-openai",
+        "class": "standard",
+        "costTier": "STANDARD",
+        "disabledReason": null,
+        "eligible": true,
+        "estimate": {
+          "cost": null,
+          "costMicrounits": null,
+          "costUnknown": true,
+          "samples": 0,
+          "tokens": null
+        },
+        "model": "openai/gpt-5.5",
+        "provider": "openai",
+        "reasoningEffort": "low"
+      },
+      "role": "developer",
+      "routing": {
+        "budgets": {
+          "context": "LOW",
+          "output": "LOW",
+          "reasoning": "LOW"
+        },
+        "costTier": "STANDARD",
+        "estimatedCost": null,
+        "estimatedInputTokens": 2000,
+        "estimatedOutputTokens": 2000,
+        "provider": "openai",
+        "rationale": "cheapest available model satisfying coding+tools",
+        "requiredCapabilities": [
+          "coding",
+          "tools"
+        ],
+        "role": "developer",
+        "selectedModel": "openai/gpt-5.5",
+        "selectionStrategy": "COST_FIRST"
+      }
+    },
+    {
+      "alternatives": [
+        {
+          "agent": "reviewer-specialist-openai",
+          "class": "premium",
+          "costTier": "PREMIUM",
+          "disabledReason": null,
+          "eligible": true,
+          "estimate": {
+            "cost": null,
+            "costMicrounits": null,
+            "costUnknown": true,
+            "samples": 0,
+            "tokens": null
+          },
+          "model": "openai/gpt-5.6-sol",
+          "provider": "openai",
+          "reasoningEffort": "medium"
+        },
+        {
+          "agent": "reviewer-openai",
+          "class": "standard",
+          "costTier": "STANDARD",
+          "disabledReason": null,
+          "eligible": true,
+          "estimate": {
+            "cost": null,
+            "costMicrounits": null,
+            "costUnknown": true,
+            "samples": 0,
+            "tokens": null
+          },
+          "model": "openai/gpt-5.6-terra",
+          "provider": "openai",
+          "reasoningEffort": "medium"
+        }
+      ],
+      "crossHarnessAlternatives": [],
+      "family": "reviewClasses",
+      "floor": "cost-first",
+      "justification": "cheapest available model satisfying review",
+      "locked": false,
+      "recommended": {
+        "agent": "reviewer-openai",
+        "class": "standard",
+        "costTier": "STANDARD",
+        "disabledReason": null,
+        "eligible": true,
+        "estimate": {
+          "cost": null,
+          "costMicrounits": null,
+          "costUnknown": true,
+          "samples": 0,
+          "tokens": null
+        },
+        "model": "openai/gpt-5.6-terra",
+        "provider": "openai",
+        "reasoningEffort": "medium"
+      },
+      "role": "reviewer",
+      "routing": {
+        "budgets": {
+          "context": "LOW",
+          "output": "LOW",
+          "reasoning": "LOW"
+        },
+        "costTier": "STANDARD",
+        "estimatedCost": null,
+        "estimatedInputTokens": 2000,
+        "estimatedOutputTokens": 2000,
+        "provider": "openai",
+        "rationale": "cheapest available model satisfying review",
+        "requiredCapabilities": [
+          "review"
+        ],
+        "role": "reviewer",
+        "selectedModel": "openai/gpt-5.6-terra",
+        "selectionStrategy": "COST_FIRST"
+      }
+    },
+    {
+      "alternatives": [
+        {
+          "agent": "qa-targeted-openai",
+          "class": "standard",
+          "costTier": "STANDARD",
+          "disabledReason": null,
+          "eligible": true,
+          "estimate": {
+            "cost": null,
+            "costMicrounits": null,
+            "costUnknown": true,
+            "samples": 0,
+            "tokens": null
+          },
+          "model": "openai/gpt-5.5",
+          "provider": "openai",
+          "reasoningEffort": "low"
+        },
+        {
+          "agent": "qa-basic-openai",
+          "class": "standard",
+          "costTier": "STANDARD",
+          "disabledReason": null,
+          "eligible": true,
+          "estimate": {
+            "cost": null,
+            "costMicrounits": null,
+            "costUnknown": true,
+            "samples": 0,
+            "tokens": null
+          },
+          "model": "openai/gpt-5.6-luna",
+          "provider": "openai",
+          "reasoningEffort": "low"
+        },
+        {
+          "agent": "qa-adversarial-openai",
+          "class": "premium",
+          "costTier": "PREMIUM",
+          "disabledReason": null,
+          "eligible": true,
+          "estimate": {
+            "cost": null,
+            "costMicrounits": null,
+            "costUnknown": true,
+            "samples": 0,
+            "tokens": null
+          },
+          "model": "openai/gpt-5.6-sol",
+          "provider": "openai",
+          "reasoningEffort": "low"
+        }
+      ],
+      "crossHarnessAlternatives": [],
+      "family": "qaClasses",
+      "floor": "cost-first",
+      "justification": "cheapest available model satisfying tools",
+      "locked": false,
+      "recommended": {
+        "agent": "qa-targeted-openai",
+        "class": "standard",
+        "costTier": "STANDARD",
+        "disabledReason": null,
+        "eligible": true,
+        "estimate": {
+          "cost": null,
+          "costMicrounits": null,
+          "costUnknown": true,
+          "samples": 0,
+          "tokens": null
+        },
+        "model": "openai/gpt-5.5",
+        "provider": "openai",
+        "reasoningEffort": "low"
+      },
+      "role": "qa",
+      "routing": {
+        "budgets": {
+          "context": "LOW",
+          "output": "VERY_LOW",
+          "reasoning": "LOW"
+        },
+        "costTier": "STANDARD",
+        "estimatedCost": null,
+        "estimatedInputTokens": 2000,
+        "estimatedOutputTokens": 800,
+        "provider": "openai",
+        "rationale": "cheapest available model satisfying tools",
+        "requiredCapabilities": [
+          "tools"
+        ],
+        "role": "qa",
+        "selectedModel": "openai/gpt-5.5",
+        "selectionStrategy": "COST_FIRST"
+      }
+    }
+  ],
+  "schemaVersion": 1,
+  "status": "PROPOSED",
+  "target": "T012",
+  "task": "T012",
+  "taskClass": {
+    "complexity": "MEDIUM",
+    "risk": "MEDIUM"
+  },
+  "verification": [
+    "task-gates",
+    "reviewer",
+    "qa-targeted",
+    "required-tests",
+    "independent-review",
+    "qa-adversarial",
+    "build"
+  ],
+  "workflow": "continue"
+}

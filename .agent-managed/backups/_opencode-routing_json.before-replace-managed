@@ -1,0 +1,95 @@
+{
+  "schemaVersion": 1,
+  "modelClasses": {
+    "cost-efficient-coding": {
+      "candidates": [
+        {
+          "agent": "developer-low-openai",
+          "model": "openai/gpt-5.6-luna",
+          "provider": "openai"
+        }
+      ]
+    },
+    "balanced-coding": {
+      "candidates": [
+        {
+          "agent": "developer-openai",
+          "model": "openai/gpt-5.5",
+          "provider": "openai"
+        }
+      ]
+    },
+    "strong-coding": {
+      "candidates": [
+        {
+          "agent": "developer-high-openai",
+          "model": "openai/gpt-5.6-sol",
+          "provider": "openai"
+        }
+      ]
+    },
+    "strongest-appropriate": {
+      "candidates": [
+        {
+          "agent": "developer-critical-openai",
+          "model": "openai/gpt-6-astra",
+          "provider": "openai"
+        }
+      ]
+    }
+  },
+  "reviewClasses": {
+    "independent-reviewer": {
+      "candidates": [
+        {
+          "agent": "reviewer-openai",
+          "model": "openai/gpt-5.6-terra",
+          "provider": "openai"
+        }
+      ]
+    },
+    "specialist-review": {
+      "candidates": [
+        {
+          "agent": "reviewer-specialist-openai",
+          "model": "openai/gpt-5.6-sol",
+          "provider": "openai"
+        }
+      ]
+    }
+  },
+  "qaClasses": {
+    "qa-basic": {
+      "candidates": [
+        {
+          "agent": "qa-basic-openai",
+          "model": "openai/gpt-5.6-luna",
+          "provider": "openai"
+        }
+      ]
+    },
+    "qa-targeted": {
+      "candidates": [
+        {
+          "agent": "qa-targeted-openai",
+          "model": "openai/gpt-5.5",
+          "provider": "openai"
+        }
+      ]
+    },
+    "qa-adversarial": {
+      "candidates": [
+        {
+          "agent": "qa-adversarial-openai",
+          "model": "openai/gpt-5.6-sol",
+          "provider": "openai"
+        },
+        {
+          "agent": "qa-adversarial-openai",
+          "model": "openai/gpt-5.6-terra",
+          "provider": "openai"
+        }
+      ]
+    }
+  }
+}

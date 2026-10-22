@@ -1889,24 +1889,43 @@ def missing_provider_models_error(root: Path, harnesses: list[str], catalog_valu
         if any(item in found for item in needs):
             continue
         native = model_catalog.NATIVE_PROVIDER_IDS.get(needs[0], (needs[0],))[0]
-        probe = model_catalog.provider_discovery_status(root, harness, needs[0])
+        discovery_failure = (
+            catalog_value.get("harnesses", {}).get(harness, {}).get("discoveryFailure")
+            if isinstance(catalog_value, dict) else None
+        )
+        if isinstance(discovery_failure, dict) and discovery_failure.get("failure"):
+            probe = {"state": "harness-missing" if discovery_failure["failure"] == "harness-missing" else "provider-unavailable", **discovery_failure}
+        else:
+            probe = model_catalog.provider_discovery_status(root, harness, needs[0])
         state = probe["state"]
+        command = probe.get("command")
+        if not isinstance(command, list):
+            command = ([harness, "models", "--standalone"]
+                       if harness == "opencode" and opencode_compat.installed_major(root) == 2
+                       else [harness, "models", native])
+        probe_command = shlex.join(command)
+        failure = probe.get("failure") or "command-failed"
         if state == "harness-missing":
             remedy = (
                 f"{harness} executable not found in PATH; install {harness.title()} "
                 f"and ensure it is on PATH, then retry."
             )
         elif state == "provider-unavailable":
-            remedy = (
-                f"the `{harness} models {native}` probe failed. Authenticate with "
-                f"`{harness} auth login` (choose GitHub Copilot), verify the Copilot "
-                f"entitlement, then retry with --discover-models."
-            )
+            remedy = f"The `{probe_command}` probe failed ({failure}). "
+            if failure == "auth-required":
+                remedy += f"OpenCode reported an authentication failure; run `{harness} auth login` and select the requested provider. "
+            else:
+                remedy += (
+                    "This does not prove an authentication failure. "
+                    f"Run `{probe_command}` in the same project to inspect the native error; "
+                    "check the installed version, project configuration and connectivity. "
+                )
+            remedy += "After resolving the native error, retry with --discover-models."
         else:
             remedy = (
-                f"the probe ran but listed no {needs} models. Verify the Copilot "
-                f"plan/entitlement and the `{harness} models {native}` output "
-                f"(try `{harness} auth login` again if needed), then retry with --discover-models."
+                f"The probe ran but listed no {needs} models. Check `{probe_command}` "
+                f"and the requested provider's account/entitlement; use `{harness} auth login` "
+                "if authentication is missing, then retry with --discover-models."
             )
         return (
             f"no models for provider(s) {needs} discovered on harness {harness!r} "

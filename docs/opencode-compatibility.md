@@ -62,6 +62,32 @@ plugin lifecycle events require separate runtime acceptance evidence.
 partial until it can be verified through a supported runtime contract; it does
 not claim an old `ai-memory.ts` file is compatible or rewrite external plugins.
 
+## Copilot discovery failure
+
+`provider-unavailable` means the native query failed; it does not establish that
+credentials are missing. The installer reports the actual command and a bounded
+failure category (timeout, launch failure, authentication required, unsupported
+arguments, invalid configuration, or generic command failure). Native output is
+not copied into the catalog or error message. Inspect it locally with the
+reported command from the same project directory.
+
+OpenCode model queries use a consistent 30-second timeout, including V1
+provider-filtered probes. A failed catalog refresh can precede successful
+model output; successful output remains usable even when stderr reports a
+registry warning. A captured OpenCode 1.18.18 run returned models after roughly
+12 seconds following a 403 fetching `models.dev/api.json`; the former
+10-second provider probe could reject that successful startup. This observation
+does not establish the cause of the remote 403 or validate an inference call.
+
+For V1, that provider-specific query is `opencode models github-copilot`; V2 uses
+`opencode models --standalone` and filters provider IDs locally. Only an explicit
+authentication error warrants the corresponding login diagnosis. A successful
+query returning no Copilot models requires checking the account's availability
+and entitlement separately. Init stops on a timeout/auth/config/launch failure;
+it does not repeat alternate queries or rerun a terminal failed query merely
+to construct its error message. Fix the native problem before retrying
+`agent-kit init --profile flutter --harness opencode --discover-models`.
+
 ## Reproducible native smoke test
 
 ```sh

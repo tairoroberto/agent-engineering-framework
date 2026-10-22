@@ -23,6 +23,53 @@ class OpenCodeCompatibilityTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(expected, compat.version_major(text))
 
+    def test_init_discovery_timeout_is_not_retried_to_construct_error_message(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as raw, patch.dict(os.environ, {}, clear=True), patch.object(compat, "installed_major", return_value=1), patch.object(catalog.shutil, "which", return_value="/bin/opencode"), patch.object(catalog.subprocess, "run", side_effect=subprocess.TimeoutExpired("opencode", 30)) as run:
+            root = Path(raw)
+            value = catalog.build_catalog(root, ["opencode"], providers_hint=["copilot"])
+            error = kit.missing_provider_models_error(root, ["opencode"], value,
+                {"default": "copilot", "allowed": ["copilot"], "strict": True})
+            self.assertIn("timeout", error)
+            self.assertEqual(1, run.call_count)
+
+    def test_v1_provider_probe_accepts_twelve_second_registry_startup(self):
+        import subprocess
+        def native(argv, **kwargs):
+            if kwargs["timeout"] < 12:
+                raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+            return subprocess.CompletedProcess(argv, 0, stdout="github-copilot/gpt-5.6-sol\n", stderr="")
+        with patch.dict(os.environ, {}, clear=True), patch.object(compat, "installed_major", return_value=1), patch.object(catalog.shutil, "which", return_value="/bin/opencode"), patch.object(catalog.subprocess, "run", side_effect=native):
+            status = catalog.provider_discovery_status(ROOT, "opencode", "copilot")
+        self.assertEqual("available", status["state"])
+        self.assertEqual(["github-copilot/gpt-5.6-sol"], status["models"])
+
+    def test_v1_probe_reports_timeout_without_trying_another_provider_alias(self):
+        import subprocess
+        with patch.dict(os.environ, {}, clear=True), patch.object(compat, "installed_major", return_value=1), patch.object(catalog.shutil, "which", return_value="/bin/opencode"), patch.object(catalog.subprocess, "run", side_effect=subprocess.TimeoutExpired("opencode", 10)) as run:
+            status = catalog.provider_discovery_status(ROOT, "opencode", "copilot")
+        self.assertEqual("provider-unavailable", status["state"])
+        self.assertEqual("timeout", status.get("failure"))
+        self.assertEqual(["opencode", "models", "github-copilot"], status.get("command"))
+        self.assertEqual(1, run.call_count)
+
+    def test_v1_probe_classifies_auth_failure_without_leaking_stderr(self):
+        import subprocess
+        result = subprocess.CompletedProcess([], 1, stdout="", stderr="Authentication required. private-token-value")
+        with patch.dict(os.environ, {}, clear=True), patch.object(compat, "installed_major", return_value=1), patch.object(catalog.shutil, "which", return_value="/bin/opencode"), patch.object(catalog.subprocess, "run", return_value=result):
+            status = catalog.provider_discovery_status(ROOT, "opencode", "copilot")
+        self.assertEqual("auth-required", status.get("failure"))
+        self.assertNotIn("private-token-value", str(status))
+
+    def test_failed_v2_probe_reports_actual_command_without_diagnosing_auth(self):
+        status = {"state": "provider-unavailable", "models": []}
+        with patch.object(compat, "installed_major", return_value=2), patch.object(catalog, "provider_discovery_status", return_value=status):
+            error = kit.missing_provider_models_error(ROOT, ["opencode"], None,
+                {"default": "copilot", "allowed": ["copilot"], "strict": True})
+        self.assertIn("opencode models --standalone", error)
+        self.assertNotIn("opencode models github-copilot", error)
+        self.assertIn("does not prove an authentication failure", error)
+
     def test_v2_model_discovery_uses_only_supported_flags(self):
         calls = []
         def run(command, executable, root, **kwargs):

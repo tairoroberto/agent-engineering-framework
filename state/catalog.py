@@ -300,14 +300,36 @@ def parse_verbose_models(output: str, harness: str) -> list[dict[str, Any]]:
     return entries
 
 
-def run_discovery(command: list[str] | None, executable: str, root: Path, *, timeout: float = 10) -> tuple[int | None, str]:
-    """Run one discovery probe. Returns (returncode, stdout); None when skipped."""
+def run_discovery(command: list[str] | None, executable: str, root: Path, *, timeout: float = 10, diagnostics: dict | None = None) -> tuple[int | None, str]:
+    """Run a bounded probe; optional diagnostics contain categories, never logs."""
+    if diagnostics is not None:
+        diagnostics.update(command=command, failure=None, exitCode=None)
     if command is None or shutil.which(executable) is None:
+        if diagnostics is not None:
+            diagnostics["failure"] = "harness-missing"
         return None, ""
     try:
         result = subprocess.run(command, cwd=root, text=True, capture_output=True, timeout=timeout, check=False)
-    except (OSError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
+        if diagnostics is not None:
+            diagnostics["failure"] = "timeout"
         return None, ""
+    except OSError:
+        if diagnostics is not None:
+            diagnostics["failure"] = "launch-failed"
+        return None, ""
+    if diagnostics is not None:
+        diagnostics["exitCode"] = result.returncode
+        if result.returncode != 0:
+            text = (result.stderr + "\n" + result.stdout).lower()
+            if any(token in text for token in ("authentication required", "not authenticated", "not logged in", "unauthorized", "invalid api key")):
+                diagnostics["failure"] = "auth-required"
+            elif any(token in text for token in ("unknown flag", "unrecognized flag", "unknown argument", "too many arguments")):
+                diagnostics["failure"] = "unsupported-arguments"
+            elif any(token in text for token in ("configinvalid", "invalid configuration", "configuration is invalid")):
+                diagnostics["failure"] = "configuration-error"
+            else:
+                diagnostics["failure"] = "command-failed"
     return result.returncode, result.stdout
 
 
@@ -335,14 +357,14 @@ def probe_native_providers(root: Path, harness: str, providers: list[str]) -> li
     for provider in providers:
         for native in NATIVE_PROVIDER_IDS.get(provider, (provider,)):
             items: list[dict[str, Any]] = []
-            returncode, stdout = run_discovery([executable, "models", native, "--verbose"], executable, root)
+            returncode, stdout = run_discovery([executable, "models", native, "--verbose"], executable, root, timeout=30)
             if returncode == 0 and stdout.strip():
                 items = [
                     entry for entry in parse_verbose_models(stdout, harness)
                     if entry.get("provider") == provider
                 ]
             if not items:
-                returncode, stdout = run_discovery([executable, "models", native], executable, root)
+                returncode, stdout = run_discovery([executable, "models", native], executable, root, timeout=30)
                 if returncode == 0:
                     items = [
                         {
@@ -358,7 +380,7 @@ def probe_native_providers(root: Path, harness: str, providers: list[str]) -> li
     return merged
 
 
-def discover_models(root: Path, harness: str, *, providers_hint: list[str] | None = None) -> tuple[list[dict[str, Any]], str | None]:
+def discover_models(root: Path, harness: str, *, providers_hint: list[str] | None = None, diagnostics: dict | None = None) -> tuple[list[dict[str, Any]], str | None]:
     injected = os.environ.get(f"AGENT_KIT_{harness.upper()}_MODELS")
     if injected is not None:
         entries: list[dict[str, Any]] = []
@@ -370,13 +392,19 @@ def discover_models(root: Path, harness: str, *, providers_hint: list[str] | Non
     found: list[dict[str, Any]] = []
     v2 = harness == "opencode" and opencode_compat.installed_major(root) == 2
     verbose = None if v2 else discovery_verbose_command(harness)
+    details = diagnostics if diagnostics is not None else {}
+    terminal_failures = {"timeout", "auth-required", "configuration-error", "launch-failed", "harness-missing"}
     if verbose is not None:
-        returncode, stdout = run_discovery(verbose, executable, root, timeout=30)
+        returncode, stdout = run_discovery(verbose, executable, root, timeout=30, diagnostics=details)
+        if details.get("failure") in terminal_failures:
+            return [], None
         if returncode == 0 and stdout.strip():
             found = parse_verbose_models(stdout, harness)
     if not found:
         command = ["opencode", "models", "--standalone"] if v2 else discovery_command(harness)
-        returncode, stdout = run_discovery(command, executable, root, timeout=30)
+        returncode, stdout = run_discovery(command, executable, root, timeout=30, diagnostics=details)
+        if details.get("failure") in terminal_failures:
+            return [], None
         if returncode is not None and returncode == 0:
             models = list(dict.fromkeys(MODEL_LINE.findall(stdout)))
             found = [
@@ -412,18 +440,25 @@ def provider_discovery_status(root: Path, harness: str, provider: str) -> dict[s
     probed = False
     found: set[str] = set()
     if harness == "opencode" and opencode_compat.installed_major(root) == 2:
-        code, output = run_discovery(["opencode", "models", "--standalone"], EXECUTABLES[harness], root, timeout=30)
+        diagnostics: dict = {}
+        code, output = run_discovery(["opencode", "models", "--standalone"], EXECUTABLES[harness], root, timeout=30, diagnostics=diagnostics)
         found = {
             model for model in MODEL_LINE.findall(output)
             if normalize_provider(model.split("/", 1)[0], harness) == provider
         } if code == 0 else set()
         return {"harness": harness, "provider": provider,
                 "state": "available" if found else "no-models" if code == 0 else "provider-unavailable",
-                "models": sorted(found)}
+                "models": sorted(found), **diagnostics}
     if harness == "opencode":
+        first_failure: dict = {}
         for native in native_ids:
-            returncode, stdout = run_discovery(["opencode", "models", native], EXECUTABLES[harness], root)
+            diagnostics = {}
+            returncode, stdout = run_discovery(["opencode", "models", native], EXECUTABLES[harness], root, timeout=30, diagnostics=diagnostics)
             if returncode is None or returncode != 0:
+                if not first_failure:
+                    first_failure = diagnostics
+                if diagnostics.get("failure") in {"timeout", "auth-required", "configuration-error", "launch-failed"}:
+                    break
                 continue
             probed = True
             for model in dict.fromkeys(MODEL_LINE.findall(stdout)):
@@ -434,7 +469,7 @@ def provider_discovery_status(root: Path, harness: str, provider: str) -> dict[s
             return {"harness": harness, "provider": provider, "state": "available", "models": sorted(found)}
         if probed:
             return {"harness": harness, "provider": provider, "state": "no-models", "models": []}
-        return {"harness": harness, "provider": provider, "state": "provider-unavailable", "models": []}
+        return {"harness": harness, "provider": provider, "state": "provider-unavailable", "models": [], **first_failure}
     models, source = discover_models(root, harness)
     wanted = {entry["id"] for entry in models if entry.get("provider") == provider}
     if wanted:
@@ -447,7 +482,8 @@ def build_catalog(root: Path, harnesses: list[str], *, discover: bool = True, pr
     for harness in harnesses:
         configured = configured_models(root, harness)
         by_key = {(entry["provider"], entry["id"]): entry for entry in configured}
-        discovered, discovery_source = discover_models(root, harness, providers_hint=providers_hint) if discover else ([], None)
+        discovery_diagnostics: dict = {}
+        discovered, discovery_source = discover_models(root, harness, providers_hint=providers_hint, diagnostics=discovery_diagnostics) if discover else ([], None)
         for item in discovered:
             model = item["id"] if isinstance(item, dict) else str(item)
             provider = item.get("provider", harness) if isinstance(item, dict) else harness
@@ -473,6 +509,7 @@ def build_catalog(root: Path, harnesses: list[str], *, discover: bool = True, pr
                 }
         models = sorted(by_key.values(), key=lambda item: (item["provider"], item["id"]))
         catalog_harnesses[harness] = {
+            **({"discoveryFailure": discovery_diagnostics} if discovery_diagnostics.get("failure") and not discovered else {}),
             "executable": EXECUTABLES[harness],
             "discovery": discovery_source or ("configured" if configured else "unavailable"),
             "capabilities": HARNESS_CAPABILITIES[harness],

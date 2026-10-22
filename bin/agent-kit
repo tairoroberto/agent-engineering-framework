@@ -1939,6 +1939,8 @@ def command_init(args: argparse.Namespace) -> None:
     root = Path(args.root).resolve()
     if not root.is_dir():
         fail(f"not a repository directory: {root}")
+    if getattr(args, "opencode_pure_discovery", False) and opencode_compat.installed_major(root) != 1:
+        fail("--opencode-pure-discovery requires a verified OpenCode 1 installation; native V2 does not support --pure")
     existing: dict | None = None
     manifest_was_valid = False
     if manifest_path(root).is_file():
@@ -2867,6 +2869,7 @@ def main() -> None:
     init.add_argument("--yes", action="store_true", help="approve a non-interactive forced reinstall")
     init.add_argument("--reuse-model-lock", action="store_true", help="reuse an existing valid model catalog lock")
     init.add_argument("--discover-models", action="store_true")
+    init.add_argument("--opencode-pure-discovery", action="store_true", help="OpenCode 1 only: omit external plugins during model discovery; normal sessions remain unchanged")
     init.add_argument("--orchestrator-model")
     init.add_argument("--memory-workspace")
     init.add_argument("--memory-project")
@@ -2972,7 +2975,18 @@ def main() -> None:
     version = sub.add_parser("version")
     version.set_defaults(func=lambda _: print(VERSION))
     args = parser.parse_args()
-    args.func(args)
+    if getattr(args, "opencode_pure_discovery", False):
+        previous = os.environ.get("AGENT_KIT_OPENCODE_DISCOVERY_PURE")
+        os.environ["AGENT_KIT_OPENCODE_DISCOVERY_PURE"] = "1"
+        try:
+            args.func(args)
+        finally:
+            if previous is None:
+                os.environ.pop("AGENT_KIT_OPENCODE_DISCOVERY_PURE", None)
+            else:
+                os.environ["AGENT_KIT_OPENCODE_DISCOVERY_PURE"] = previous
+    else:
+        args.func(args)
 
 
 if __name__ == "__main__":

@@ -443,6 +443,36 @@ class CopilotProviderTest(unittest.TestCase):
             self.assertIn("ORCHESTRATOR_MODEL: github-copilot/gpt-5.3-codex", result.stdout)
             self.assertIn("DOCTOR: PASS", result.stdout)
 
+    def test_init_can_opt_into_pure_discovery_without_changing_runtime_plugins(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            root = base / "consumer"
+            root.mkdir()
+            fake_bin = base / "bin"
+            fake_bin.mkdir()
+            binary = fake_bin / "opencode"
+            binary.write_text(
+                '#!/bin/sh\n'
+                'if [ "$1" = "--version" ]; then echo "1.18.18"; exit 0; fi\n'
+                'if [ "$1" = "--pure" ] && [ "$2" = "models" ] && [ "$3" = "github-copilot" ] && [ "$#" = "3" ]; then echo "github-copilot/gpt-5.3-codex"; exit 0; fi\n'
+                'echo "plugin startup failed" >&2; exit 1\n'
+            )
+            binary.chmod(0o755)
+            project_config = root / "opencode.json"
+            custom = '{"plugin": ["corporate-plugin"]}\n'
+            project_config.write_text(custom)
+            env = {**os.environ, "PATH": f"{fake_bin}:/usr/bin:/bin"}
+            env.pop("AGENT_KIT_OPENCODE_DISCOVERY_PURE", None)
+            default = self.run_cli(root, "init", "--profile", "flutter", "--harness", "opencode",
+                "--provider", "copilot", models=None, env=env, check=False)
+            self.assertNotEqual(0, default.returncode)
+            result = self.run_cli(root, "init", "--profile", "flutter", "--harness", "opencode",
+                "--provider", "copilot", "--opencode-pure-discovery", "--discover-models",
+                "--memory-workspace", "tests", "--memory-project", root.name, models=None, env=env)
+            self.assertIn("ORCHESTRATOR_MODEL: github-copilot/gpt-5.3-codex", result.stdout)
+            self.assertEqual(custom, project_config.read_text())
+            self.assertNotIn("--pure", (root / ".opencode/opencode.json").read_text())
+
     def test_env_check_reports_copilot_routes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "consumer"

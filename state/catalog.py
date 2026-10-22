@@ -302,6 +302,10 @@ def parse_verbose_models(output: str, harness: str) -> list[dict[str, Any]]:
 
 def run_discovery(command: list[str] | None, executable: str, root: Path, *, timeout: float = 10, diagnostics: dict | None = None) -> tuple[int | None, str]:
     """Run a bounded probe; optional diagnostics contain categories, never logs."""
+    if command is not None and executable == "opencode" and len(command) > 1 and command[1] == "models" and os.environ.get("AGENT_KIT_OPENCODE_DISCOVERY_PURE") == "1":
+        # Explicit opt-in for metadata queries only. Never change dispatch,
+        # plugin configuration, or silently disable plugins after a failure.
+        command = [command[0], "--pure", *command[1:]]
     if diagnostics is not None:
         diagnostics.update(command=command, failure=None, exitCode=None)
     if command is None or shutil.which(executable) is None:
@@ -394,6 +398,19 @@ def discover_models(root: Path, harness: str, *, providers_hint: list[str] | Non
     verbose = None if v2 else discovery_verbose_command(harness)
     details = diagnostics if diagnostics is not None else {}
     terminal_failures = {"timeout", "auth-required", "configuration-error", "launch-failed", "harness-missing"}
+    if harness == "opencode" and os.environ.get("AGENT_KIT_OPENCODE_DISCOVERY_PURE") == "1":
+        # Use the small provider-specific query verified by the operator,
+        # rather than enumerate every provider with verbose metadata.
+        commands = [["opencode", "models", NATIVE_PROVIDER_IDS.get(provider, (provider,))[0]] for provider in providers_hint] if providers_hint else [["opencode", "models"]]
+        for command in commands:
+            code, output = run_discovery(command, executable, root, timeout=30, diagnostics=details)
+            if code != 0:
+                return [], None
+            for model in dict.fromkeys(MODEL_LINE.findall(output)):
+                provider = normalize_provider(model.split("/", 1)[0], harness)
+                if not providers_hint or provider in providers_hint:
+                    found.append({"id": model, "provider": provider})
+        return found, "harness" if found else None
     if verbose is not None:
         returncode, stdout = run_discovery(verbose, executable, root, timeout=30, diagnostics=details)
         if details.get("failure") in terminal_failures:

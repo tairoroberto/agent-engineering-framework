@@ -88,6 +88,25 @@ it does not repeat alternate queries or rerun a terminal failed query merely
 to construct its error message. Fix the native problem before retrying
 `agent-kit init --profile flutter --harness opencode --discover-models`.
 
+### OpenCode 1 discovery without external plugins
+
+If `opencode --pure models github-copilot` succeeds while normal discovery
+hangs, explicitly request plugin-free metadata discovery:
+
+```sh
+agent-kit init --profile flutter --harness opencode --discover-models --opencode-pure-discovery
+```
+
+This adds `--pure` only to OpenCode model-list commands during that invocation.
+It does not edit plugin configuration, change runtime agents or add `--pure`
+to dispatched AI sessions. It is not an automatic timeout fallback, and it does
+not persist to later commands. Native V2 does not support this V1 flag; init
+rejects the option before project changes on an unverified/V2 installation.
+
+A successful pure query does not identify a specific broken plugin: plugin
+startup, registry/network timing and cache state must be distinguished locally.
+The mode also cannot discover models supplied exclusively by external plugins.
+
 ## Reproducible native smoke test
 
 ```sh
